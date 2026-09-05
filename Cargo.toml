@@ -1,0 +1,31 @@
+[package]
+name = "meta-call-lsp"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+description = "Polyglot language server over the meta-ast index"
+license = "Apache-2.0"
+repository = "https://github.com/metacall/lsp"
+
+[[bin]]
+name = "meta-call-lsp"
+path = "src/main.rs"
+
+[lib]
+name = "meta_call_lsp"
+path = "src/lib.rs"
+
+[dependencies]
+meta-ast = "0.5.1"
+lsp-server = "0.10"
+lsp-types = "0.97"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+url = "2.5"
+anyhow = "1.0"
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3.27"
