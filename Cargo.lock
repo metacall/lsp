@@ -718,6 +718,7 @@ name = "meta-call-lsp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "crossbeam-channel",
  "lsp-server",
  "lsp-types",
  "meta-ast",
