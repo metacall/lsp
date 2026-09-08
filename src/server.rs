@@ -91,7 +91,8 @@ struct State {
 impl State {
     fn new(root: PathBuf) -> anyhow::Result<Self> {
         let buffers = BufferStore::default();
-        let snapshot = Arc::new(index::rebuild(&root, &buffers, 1)?);
+        let inputs = index::collect_inputs(&root, &buffers);
+        let snapshot = Arc::new(index::rebuild_from_inputs(&root, &inputs, 1)?);
         Ok(Self {
             root,
             buffers,
@@ -105,7 +106,11 @@ impl State {
         if self.counter == 0 {
             self.counter = 1;
         }
-        match index::rebuild(&self.root, &self.buffers, self.counter) {
+        match index::rebuild_from_inputs(
+            &self.root,
+            &index::collect_inputs(&self.root, &self.buffers),
+            self.counter,
+        ) {
             Ok(snapshot) => self.snapshot = Arc::new(snapshot),
             Err(error) => tracing::warn!(%error, "reindex failed, keeping prior snapshot"),
         }

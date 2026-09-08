@@ -22,7 +22,7 @@ fn uri_of(path: &Path) -> String {
 }
 
 fn snapshot(dir: &Path, buffers: &BufferStore) -> index::IndexSnapshot {
-    index::rebuild(dir, buffers, 1).unwrap()
+    index::rebuild_from_inputs(dir, &index::collect_inputs(dir, buffers), 1).unwrap()
 }
 
 fn pos(line: u32, character: u32) -> Position {

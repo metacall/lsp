@@ -1,5 +1,4 @@
 //! Snapshot build plus read queries.
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use lsp_types::Position;
@@ -16,48 +15,54 @@ pub struct IndexSnapshot {
     pub diagnostics: Vec<meta_ast::Diagnostic>,
 }
 
-impl IndexSnapshot {
-    pub fn empty(root: PathBuf, id: meta_ast::model::SnapshotId) -> Self {
-        Self {
-            id,
-            root,
-            extractions: Vec::new(),
-            graph: meta_ast::CodeGraph::new(id),
-            diagnostics: Vec::new(),
-        }
-    }
+pub struct OverlayDoc {
+    pub uri: String,
+    pub path: PathBuf,
+    pub text: String,
+    pub version: i32,
+    pub lang: meta_ast::LangId,
 }
 
-pub fn rebuild(
-    root: &Path,
-    buffers: &BufferStore,
-    snapshot_raw: u32,
-) -> anyhow::Result<IndexSnapshot> {
-    let discovered = meta_ast::input::discover_files(root, None)?;
-    let mut overlay: HashMap<PathBuf, String> = HashMap::new();
-    for (uri, _) in buffers.iter() {
+pub fn collect_inputs(root: &Path, buffers: &BufferStore) -> Vec<OverlayDoc> {
+    let mut inputs = Vec::new();
+    for (uri, doc) in buffers.iter() {
         if let Some(path) = convert::uri_to_path(uri)
             && path.starts_with(root)
         {
-            overlay.insert(path, uri.clone());
+            inputs.push(OverlayDoc {
+                uri: uri.clone(),
+                path,
+                text: doc.text.clone(),
+                version: doc.version,
+                lang: doc.lang,
+            });
         }
+    }
+    inputs.sort_by(|a, b| a.path.cmp(&b.path));
+    inputs
+}
+
+pub fn rebuild_from_inputs(
+    root: &Path,
+    overlays: &[OverlayDoc],
+    snapshot_raw: u32,
+) -> anyhow::Result<IndexSnapshot> {
+    let discovered = meta_ast::input::discover_files(root, None)?;
+    let mut overlay_paths = std::collections::HashSet::new();
+    for input in overlays {
+        overlay_paths.insert(input.path.clone());
     }
     let id_gens = ExtractionIdGenerators::new();
     let disk: Vec<(PathBuf, meta_ast::LangId)> = discovered
         .into_iter()
-        .filter(|(path, _)| !overlay.contains_key(path))
+        .filter(|(path, _)| !overlay_paths.contains(path))
         .collect();
     let mut files =
         meta_ast::extract_with_id_gen(&disk, &ExtractOptions::default(), &id_gens).files;
-    let mut names: Vec<(PathBuf, String)> = overlay.into_iter().collect();
-    names.sort_by(|a, b| a.0.cmp(&b.0));
-    for (path, uri) in &names {
-        let Some(doc) = buffers.get(uri.as_str()) else {
-            continue;
-        };
+    for doc in overlays {
         match meta_ast::extract_text_with_id_gen(
             InMemorySource {
-                uri: uri.as_str(),
+                uri: doc.uri.as_str(),
                 text: doc.text.as_str(),
                 version: doc.version,
                 language: doc.lang,
@@ -67,7 +72,7 @@ pub fn rebuild(
         ) {
             Ok(versioned) => files.push(versioned.file),
             Err(error) => files.push(meta_ast::FileExtraction::failed(
-                path.clone(),
+                doc.path.clone(),
                 doc.lang,
                 error.to_string(),
             )),
