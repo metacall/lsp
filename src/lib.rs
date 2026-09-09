@@ -4,5 +4,6 @@ pub mod convert;
 pub mod error;
 pub mod handlers;
 pub mod index;
+pub mod position;
 pub mod reindex;
 pub mod server;

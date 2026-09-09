@@ -4,16 +4,23 @@ use lsp_types::{
 };
 
 use crate::convert;
-use crate::index::{IndexSnapshot, definition_target, file_for_uri, symbol_at};
+use crate::index::{self, IndexSnapshot, SourceText};
+use crate::position::{self, Encoding};
 
 #[allow(deprecated)]
-pub fn document_symbols(snapshot: &IndexSnapshot, uri: &str) -> Vec<SymbolInformation> {
-    let Some(file) = file_for_uri(snapshot, uri) else {
+pub fn document_symbols(
+    snapshot: &IndexSnapshot,
+    sources: &dyn SourceText,
+    uri: &str,
+    encoding: Encoding,
+) -> Vec<SymbolInformation> {
+    let Some(file) = index::file_for_uri(snapshot, uri) else {
         return Vec::new();
     };
     let Some(file_uri) = convert::path_to_uri(&file.path) else {
         return Vec::new();
     };
+    let text = sources.source(&file.path);
     file.symbols
         .iter()
         .map(|symbol| SymbolInformation {
@@ -23,15 +30,24 @@ pub fn document_symbols(snapshot: &IndexSnapshot, uri: &str) -> Vec<SymbolInform
             deprecated: None,
             location: Location {
                 uri: file_uri.clone(),
-                range: convert::range_to_lsp(&symbol.source_range),
+                range: position::range(text.as_deref(), &symbol.source_range, encoding),
             },
             container_name: None,
         })
         .collect()
 }
 
-pub fn hover_at(snapshot: &IndexSnapshot, uri: &str, pos: Position) -> Option<Hover> {
-    let symbol = symbol_at(snapshot, uri, pos)?;
+pub fn hover_at(
+    snapshot: &IndexSnapshot,
+    sources: &dyn SourceText,
+    uri: &str,
+    pos: Position,
+    encoding: Encoding,
+) -> Option<Hover> {
+    let file = index::file_for_uri(snapshot, uri)?;
+    let text = sources.source(&file.path)?;
+    let byte = position::to_byte_offset(&text, pos, encoding)?;
+    let symbol = index::symbol_at(snapshot, uri, byte)?;
     let mut value = format!(
         "**{}** ({})\n\n```{}\n{}\n```",
         symbol.name,
@@ -48,26 +64,47 @@ pub fn hover_at(snapshot: &IndexSnapshot, uri: &str, pos: Position) -> Option<Ho
             kind: MarkupKind::Markdown,
             value,
         }),
-        range: Some(convert::range_to_lsp(&symbol.source_range)),
+        range: Some(position::range(
+            Some(text.as_ref()),
+            &symbol.source_range,
+            encoding,
+        )),
     })
 }
 
-pub fn definition_at(snapshot: &IndexSnapshot, uri: &str, pos: Position) -> Option<Location> {
-    let (target_uri, target_range) = definition_target(snapshot, uri, pos)?;
+pub fn definition_at(
+    snapshot: &IndexSnapshot,
+    sources: &dyn SourceText,
+    uri: &str,
+    pos: Position,
+    encoding: Encoding,
+) -> Option<Location> {
+    let file = index::file_for_uri(snapshot, uri)?;
+    let text = sources.source(&file.path)?;
+    let byte = position::to_byte_offset(&text, pos, encoding)?;
+    let target = index::definition_target(snapshot, uri, byte)?;
+    let target_uri = convert::path_to_uri(&target.path)?;
+    let target_text = sources.source(&target.path);
     Some(Location {
-        uri: target_uri.parse().ok()?,
-        range: convert::range_to_lsp(&target_range),
+        uri: target_uri,
+        range: position::range(target_text.as_deref(), &target.range, encoding),
     })
 }
 
-pub fn diagnostics_for(snapshot: &IndexSnapshot, uri: &str) -> Vec<lsp_types::Diagnostic> {
+pub fn diagnostics_for(
+    snapshot: &IndexSnapshot,
+    sources: &dyn SourceText,
+    uri: &str,
+    encoding: Encoding,
+) -> Vec<lsp_types::Diagnostic> {
     let Some(path) = convert::uri_to_path(uri) else {
         return Vec::new();
     };
+    let text = sources.source(&path);
     snapshot
         .diagnostics
         .iter()
         .filter(|diagnostic| diagnostic.path == path)
-        .map(convert::diagnostic_to_lsp)
+        .map(|diagnostic| convert::diagnostic_to_lsp(text.as_deref(), diagnostic, encoding))
         .collect()
 }

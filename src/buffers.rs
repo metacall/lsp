@@ -1,14 +1,17 @@
 //! Open buffer overlay.
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
-use lsp_types::{Position, Range, TextDocumentContentChangeEvent};
+use lsp_types::{Range, TextDocumentContentChangeEvent};
 
 use crate::convert;
+use crate::position::{self, Encoding};
 
 pub struct OpenDoc {
     pub version: i32,
     pub lang: meta_ast::LangId,
     pub text: String,
+    pub path: Option<PathBuf>,
 }
 
 #[derive(Default)]
@@ -27,6 +30,7 @@ impl BufferStore {
                 version,
                 lang,
                 text,
+                path: convert::uri_to_path(uri),
             },
         );
         true
@@ -37,6 +41,7 @@ impl BufferStore {
         uri: &str,
         version: i32,
         changes: &[TextDocumentContentChangeEvent],
+        encoding: Encoding,
     ) -> bool {
         let Some(doc) = self.docs.get_mut(uri) else {
             return false;
@@ -46,7 +51,7 @@ impl BufferStore {
         }
         for change in changes {
             match change.range {
-                Some(range) => apply_patch(&mut doc.text, range, change.text.as_str()),
+                Some(range) => apply_patch(&mut doc.text, range, change.text.as_str(), encoding),
                 None => doc.text.clone_from(&change.text),
             }
         }
@@ -73,12 +78,18 @@ impl BufferStore {
         self.docs.get(uri)
     }
 
+    pub fn by_path(&self, path: &Path) -> Option<&OpenDoc> {
+        self.docs
+            .values()
+            .find(|doc| doc.path.as_deref() == Some(path))
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (&String, &OpenDoc)> {
         self.docs.iter()
     }
 }
 
-pub fn lang_for(uri: &str, language_id: &str) -> Option<meta_ast::LangId> {
+fn lang_for(uri: &str, language_id: &str) -> Option<meta_ast::LangId> {
     if let Some(lang) = lang_from_id(language_id) {
         return Some(lang);
     }
@@ -102,37 +113,31 @@ fn lang_from_id(id: &str) -> Option<meta_ast::LangId> {
     }
 }
 
-fn apply_patch(text: &mut String, range: Range, replacement: &str) {
-    let start = offset_of(text, range.start);
-    let end = offset_of(text, range.end).max(start);
+fn apply_patch(text: &mut String, range: Range, replacement: &str, encoding: Encoding) {
+    let start = position::to_byte_offset(text, range.start, encoding).unwrap_or(text.len());
+    let end = position::to_byte_offset(text, range.end, encoding)
+        .unwrap_or(text.len())
+        .max(start);
     text.replace_range(start..end, replacement);
-}
-
-fn offset_of(text: &str, pos: Position) -> usize {
-    let line = pos.line as usize;
-    let mut column = pos.character as usize;
-    let mut offset = 0usize;
-    for (index, content) in text.split('\n').enumerate() {
-        if index == line {
-            column = column.min(content.len());
-            while !content.is_char_boundary(column) {
-                column -= 1;
-            }
-            return offset + column;
-        }
-        offset += content.len() + 1;
-    }
-    text.len()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lsp_types::Position;
 
     fn store() -> BufferStore {
         let mut store = BufferStore::default();
         assert!(store.open("file:///a.py", 1, "python", "x = 1\n".to_string()));
         store
+    }
+
+    fn full_text(text: &str) -> TextDocumentContentChangeEvent {
+        TextDocumentContentChangeEvent {
+            range: None,
+            range_length: None,
+            text: text.to_string(),
+        }
     }
 
     #[test]
@@ -145,30 +150,14 @@ mod tests {
     #[test]
     fn change_applies_full_text() {
         let mut store = store();
-        assert!(store.change(
-            "file:///a.py",
-            2,
-            &[TextDocumentContentChangeEvent {
-                range: None,
-                range_length: None,
-                text: "y = 2\n".to_string(),
-            }],
-        ));
+        assert!(store.change("file:///a.py", 2, &[full_text("y = 2\n")], Encoding::Utf16));
         assert_eq!(store.get("file:///a.py").unwrap().text, "y = 2\n");
     }
 
     #[test]
     fn change_ignores_stale_version() {
         let mut store = store();
-        assert!(!store.change(
-            "file:///a.py",
-            1,
-            &[TextDocumentContentChangeEvent {
-                range: None,
-                range_length: None,
-                text: "y = 2\n".to_string(),
-            }],
-        ));
+        assert!(!store.change("file:///a.py", 1, &[full_text("y = 2\n")], Encoding::Utf16));
         assert_eq!(store.get("file:///a.py").unwrap().text, "x = 1\n");
     }
 
@@ -193,8 +182,36 @@ mod tests {
                 range_length: None,
                 text: "y".to_string(),
             }],
+            Encoding::Utf16,
         ));
         assert_eq!(store.get("file:///a.py").unwrap().text, "y = 1\n");
+    }
+
+    #[test]
+    fn range_patch_honors_utf16_columns() {
+        let mut store = BufferStore::default();
+        assert!(store.open("file:///a.py", 1, "python", "x = \"🐍\"\n".to_string()));
+        let range = Range {
+            start: Position {
+                line: 0,
+                character: 5,
+            },
+            end: Position {
+                line: 0,
+                character: 7,
+            },
+        };
+        assert!(store.change(
+            "file:///a.py",
+            2,
+            &[TextDocumentContentChangeEvent {
+                range: Some(range),
+                range_length: None,
+                text: "z".to_string(),
+            }],
+            Encoding::Utf16,
+        ));
+        assert_eq!(store.get("file:///a.py").unwrap().text, "x = \"z\"\n");
     }
 
     #[test]
@@ -202,5 +219,12 @@ mod tests {
         let mut store = store();
         assert!(!store.save("file:///a.py", "x = 1\n"));
         assert!(store.save("file:///a.py", "x = 2\n"));
+    }
+
+    #[test]
+    fn by_path_finds_open_doc() {
+        let store = store();
+        assert!(store.by_path(Path::new("/a.py")).is_some());
+        assert!(store.by_path(Path::new("/b.py")).is_none());
     }
 }

@@ -1,12 +1,23 @@
+use std::borrow::Cow;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use meta_call_lsp::buffers::BufferStore;
-use meta_call_lsp::index::IndexSnapshot;
+use meta_call_lsp::index::{IndexSnapshot, SourceText};
+use meta_call_lsp::position::Encoding;
 use meta_call_lsp::reindex::{ReindexReq, spawn_worker};
 use meta_call_lsp::{convert, handlers, index};
 
 const APP: &str = "def greet(name):\n    return name\n\n\nresult = greet(\"x\")\n";
+
+struct DiskSources;
+
+impl SourceText for DiskSources {
+    fn source(&self, path: &Path) -> Option<Cow<'_, str>> {
+        std::fs::read_to_string(path).ok().map(Cow::Owned)
+    }
+}
 
 fn workspace() -> (tempfile::TempDir, String) {
     let dir = tempfile::tempdir().unwrap();
@@ -71,7 +82,8 @@ fn burst_coalesces_to_latest() {
         );
     }
     let snapshot = recv_until(&resp_rx, 6);
-    let symbols = handlers::document_symbols(&snapshot, uri.as_str());
+    let sources = DiskSources;
+    let symbols = handlers::document_symbols(&snapshot, &sources, uri.as_str(), Encoding::Utf16);
     assert!(symbols.iter().any(|symbol| symbol.name == "marker_6"));
     drop(req_tx);
     worker.join().unwrap();
@@ -100,10 +112,11 @@ fn readers_hold_old_snapshot_during_reindex() {
         line: 0,
         character: 5,
     };
-    assert!(handlers::hover_at(&old, uri.as_str(), pos).is_some());
+    let sources = DiskSources;
+    assert!(handlers::hover_at(&old, &sources, uri.as_str(), pos, Encoding::Utf16).is_some());
     let snapshot = recv_until(&resp_rx, 1);
-    assert!(handlers::hover_at(&old, uri.as_str(), pos).is_some());
-    let symbols = handlers::document_symbols(&snapshot, uri.as_str());
+    assert!(handlers::hover_at(&old, &sources, uri.as_str(), pos, Encoding::Utf16).is_some());
+    let symbols = handlers::document_symbols(&snapshot, &sources, uri.as_str(), Encoding::Utf16);
     assert!(symbols.iter().any(|symbol| symbol.name == "extra"));
     drop(req_tx);
     worker.join().unwrap();
