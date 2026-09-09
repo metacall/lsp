@@ -1,7 +1,7 @@
 //! Snapshot build plus read queries.
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
-use lsp_types::Position;
 use meta_ast::{ExtractOptions, ExtractionIdGenerators, GraphBuilder, InMemorySource};
 
 use crate::buffers::BufferStore;
@@ -21,6 +21,17 @@ pub struct OverlayDoc {
     pub text: String,
     pub version: i32,
     pub lang: meta_ast::LangId,
+}
+
+/// Source text lookup for range conversion.
+pub trait SourceText {
+    fn source(&self, path: &Path) -> Option<Cow<'_, str>>;
+}
+
+/// Definition result. The path is the target file, not the request file.
+pub struct DefinitionTarget {
+    pub path: PathBuf,
+    pub range: meta_ast::model::SourceRange,
 }
 
 pub fn collect_inputs(root: &Path, buffers: &BufferStore) -> Vec<OverlayDoc> {
@@ -79,6 +90,14 @@ pub fn rebuild_from_inputs(
         }
     }
     files.sort_by(|a, b| a.path.cmp(&b.path));
+    finish_snapshot(root, files, snapshot_raw)
+}
+
+fn finish_snapshot(
+    root: &Path,
+    files: Vec<meta_ast::FileExtraction>,
+    snapshot_raw: u32,
+) -> anyhow::Result<IndexSnapshot> {
     let raw = if snapshot_raw == 0 { 1 } else { snapshot_raw };
     let Some(id) = meta_ast::model::SnapshotId::new(raw) else {
         anyhow::bail!("snapshot counter exhausted");
@@ -106,15 +125,18 @@ pub fn file_for_uri<'a>(
     snapshot.extractions.iter().find(|file| file.path == path)
 }
 
-pub fn symbol_at<'a>(
-    snapshot: &'a IndexSnapshot,
-    uri: &str,
-    pos: Position,
-) -> Option<&'a meta_ast::Symbol> {
-    let file = file_for_uri(snapshot, uri)?;
+fn contains_byte(range: &meta_ast::model::SourceRange, byte: usize) -> bool {
+    if range.byte_end > range.byte_start {
+        range.byte_start <= byte && byte < range.byte_end
+    } else {
+        byte == range.byte_start
+    }
+}
+
+fn smallest_symbol_at(file: &meta_ast::FileExtraction, byte: usize) -> Option<&meta_ast::Symbol> {
     file.symbols
         .iter()
-        .filter(|symbol| convert::contains(&symbol.source_range, pos))
+        .filter(|symbol| contains_byte(&symbol.source_range, byte))
         .min_by_key(|symbol| {
             symbol
                 .source_range
@@ -123,32 +145,31 @@ pub fn symbol_at<'a>(
         })
 }
 
+pub fn symbol_at<'a>(
+    snapshot: &'a IndexSnapshot,
+    uri: &str,
+    byte: usize,
+) -> Option<&'a meta_ast::Symbol> {
+    let file = file_for_uri(snapshot, uri)?;
+    smallest_symbol_at(file, byte)
+}
+
 pub fn definition_target(
     snapshot: &IndexSnapshot,
     uri: &str,
-    pos: Position,
-) -> Option<(String, meta_ast::model::SourceRange)> {
+    byte: usize,
+) -> Option<DefinitionTarget> {
     let file = file_for_uri(snapshot, uri)?;
-    if let Some(symbol) = file
-        .symbols
-        .iter()
-        .filter(|symbol| convert::contains(&symbol.source_range, pos))
-        .min_by_key(|symbol| {
-            symbol
-                .source_range
-                .byte_end
-                .saturating_sub(symbol.source_range.byte_start)
-        })
-    {
-        let target = convert::path_to_uri(&symbol.file_path)?
-            .as_str()
-            .to_string();
-        return Some((target, symbol.source_range.clone()));
+    if let Some(symbol) = smallest_symbol_at(file, byte) {
+        return Some(DefinitionTarget {
+            path: symbol.file_path.clone(),
+            range: symbol.source_range.clone(),
+        });
     }
     let reference = file
         .references
         .iter()
-        .find(|reference| convert::contains(&reference.range, pos))?;
+        .find(|reference| contains_byte(&reference.range, byte))?;
     let same_file = snapshot
         .extractions
         .iter()
@@ -160,8 +181,8 @@ pub fn definition_target(
         .flat_map(|file| file.symbols.iter())
         .find(|symbol| symbol.name == reference.name && symbol.language == file.lang);
     let target = same_file.or(any_file)?;
-    let target_uri = convert::path_to_uri(&target.file_path)?
-        .as_str()
-        .to_string();
-    Some((target_uri, target.source_range.clone()))
+    Some(DefinitionTarget {
+        path: target.file_path.clone(),
+        range: target.source_range.clone(),
+    })
 }

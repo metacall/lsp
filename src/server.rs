@@ -1,4 +1,5 @@
 //! Sync LSP loop.
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -13,8 +14,8 @@ use lsp_types::{
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     DidSaveTextDocumentParams, DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams,
     GotoDefinitionResponse, HoverParams, HoverProviderCapability, InitializeParams, OneOf,
-    PositionEncodingKind, PublishDiagnosticsParams, ServerCapabilities, TextDocumentSyncCapability,
-    TextDocumentSyncKind, Uri,
+    PublishDiagnosticsParams, ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind,
+    Uri,
 };
 use lsp_types::{notification, request};
 
@@ -22,7 +23,8 @@ use crate::buffers::BufferStore;
 use crate::convert;
 use crate::error::ServerError;
 use crate::handlers;
-use crate::index::{self, IndexSnapshot};
+use crate::index::{self, IndexSnapshot, SourceText};
+use crate::position::{self, Encoding};
 use crate::reindex::{self, ReindexReq, ReindexResp};
 
 const SERVER_NAME: &str = "meta-ast-lsp";
@@ -39,20 +41,21 @@ pub fn run() -> anyhow::Result<()> {
     let params: InitializeParams =
         serde_json::from_value(init_value).context("parse initialize params")?;
     let root = root_from_params(&params)?;
+    let encoding = position::negotiate(&params.capabilities);
     connection
         .initialize_finish(
             request_id,
             serde_json::json!({
-                "capabilities": capabilities(),
+                "capabilities": capabilities(encoding),
                 "serverInfo": {"name": SERVER_NAME, "version": env!("CARGO_PKG_VERSION")},
             }),
         )
         .context("send initialize result")?;
-    tracing::info!(root = %root.display(), "serving");
+    tracing::info!(root = %root.display(), ?encoding, "serving");
     let (req_tx, req_rx) = crossbeam_channel::unbounded();
     let (resp_tx, resp_rx) = crossbeam_channel::unbounded();
     let worker = reindex::spawn_worker(req_rx, resp_tx);
-    let mut state = State::new(root, req_tx)?;
+    let mut state = State::new(root, req_tx, encoding)?;
     let mut shutdown = false;
     loop {
         if let Some(remaining) = state.pending_remaining() {
@@ -163,10 +166,13 @@ struct State {
     applied_seq: u64,
     req_tx: Sender<ReindexReq>,
     pending: Option<Pending>,
+    encoding: Encoding,
 }
 
 impl State {
-    fn new(root: PathBuf, req_tx: Sender<ReindexReq>) -> anyhow::Result<Self> {
+    fn new(root: PathBuf, req_tx: Sender<ReindexReq>, encoding: Encoding) -> anyhow::Result<Self> {
+        // Build the first snapshot before the loop. Clients request document
+        // symbols right after didOpen, so an empty initial snapshot is not usable.
         let buffers = BufferStore::default();
         let inputs = index::collect_inputs(&root, &buffers);
         let snapshot = Arc::new(index::rebuild_from_inputs(&root, &inputs, 1)?);
@@ -179,6 +185,7 @@ impl State {
             applied_seq: 0,
             req_tx,
             pending: None,
+            encoding,
         })
     }
 
@@ -237,6 +244,15 @@ impl State {
     }
 }
 
+impl SourceText for State {
+    fn source(&self, path: &Path) -> Option<Cow<'_, str>> {
+        if let Some(doc) = self.buffers.by_path(path) {
+            return Some(Cow::Borrowed(doc.text.as_str()));
+        }
+        std::fs::read_to_string(path).ok().map(Cow::Owned)
+    }
+}
+
 fn drain_resps(connection: &Connection, state: &mut State, resp_rx: &Receiver<ReindexResp>) {
     while let Ok(resp) = resp_rx.try_recv() {
         apply_resp(connection, state, resp);
@@ -264,9 +280,9 @@ fn apply_resp(connection: &Connection, state: &mut State, resp: ReindexResp) {
     }
 }
 
-fn capabilities() -> ServerCapabilities {
+fn capabilities(encoding: Encoding) -> ServerCapabilities {
     ServerCapabilities {
-        position_encoding: Some(PositionEncodingKind::UTF8),
+        position_encoding: Some(encoding.as_lsp()),
         text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
         document_symbol_provider: Some(OneOf::Left(true)),
         hover_provider: Some(HoverProviderCapability::Simple(true)),
@@ -306,8 +322,12 @@ fn handle_request(connection: &Connection, state: &State, request: WireRequest) 
     if method == request::DocumentSymbolRequest::METHOD {
         match serde_json::from_value::<DocumentSymbolParams>(params) {
             Ok(params) => {
-                let symbols =
-                    handlers::document_symbols(&state.snapshot, params.text_document.uri.as_str());
+                let symbols = handlers::document_symbols(
+                    &state.snapshot,
+                    state,
+                    params.text_document.uri.as_str(),
+                    state.encoding,
+                );
                 respond_or_warn(connection, id, &DocumentSymbolResponse::Flat(symbols));
             }
             Err(error) => respond_protocol_error(connection, id, error.to_string()),
@@ -317,7 +337,13 @@ fn handle_request(connection: &Connection, state: &State, request: WireRequest) 
             Ok(params) => {
                 let position = params.text_document_position_params.position;
                 let uri = params.text_document_position_params.text_document.uri;
-                let hover = handlers::hover_at(&state.snapshot, uri.as_str(), position);
+                let hover = handlers::hover_at(
+                    &state.snapshot,
+                    state,
+                    uri.as_str(),
+                    position,
+                    state.encoding,
+                );
                 respond_or_warn(connection, id, &hover);
             }
             Err(error) => respond_protocol_error(connection, id, error.to_string()),
@@ -327,7 +353,13 @@ fn handle_request(connection: &Connection, state: &State, request: WireRequest) 
             Ok(params) => {
                 let position = params.text_document_position_params.position;
                 let uri = params.text_document_position_params.text_document.uri;
-                let target = handlers::definition_at(&state.snapshot, uri.as_str(), position);
+                let target = handlers::definition_at(
+                    &state.snapshot,
+                    state,
+                    uri.as_str(),
+                    position,
+                    state.encoding,
+                );
                 let result: Option<GotoDefinitionResponse> =
                     target.map(GotoDefinitionResponse::Scalar);
                 respond_or_warn(connection, id, &result);
@@ -353,13 +385,17 @@ fn handle_notification(state: &mut State, notification: WireNotification) -> Opt
             return None;
         };
         let uri = params.text_document.uri.as_str().to_string();
-        state.buffers.open(
+        let opened = state.buffers.open(
             uri.as_str(),
             params.text_document.version,
             params.text_document.language_id.as_str(),
             params.text_document.text,
         );
-        state.schedule(true);
+        if opened {
+            state.schedule(true);
+        } else {
+            tracing::debug!(%uri, "didOpen ignored for unsupported language");
+        }
         None
     } else if method == notification::DidChangeTextDocument::METHOD {
         let Ok(params) = serde_json::from_value::<DidChangeTextDocumentParams>(params) else {
@@ -371,6 +407,7 @@ fn handle_notification(state: &mut State, notification: WireNotification) -> Opt
             uri.as_str(),
             params.text_document.version,
             &params.content_changes,
+            state.encoding,
         ) {
             state.schedule(false);
         }
@@ -395,7 +432,7 @@ fn handle_notification(state: &mut State, notification: WireNotification) -> Opt
         if let Some(text) = params.text.as_deref() {
             changed = state.buffers.save(uri.as_str(), text);
         }
-        if changed {
+        if changed || params.text.is_none() {
             state.schedule(true);
         } else {
             state.flush();
@@ -442,7 +479,7 @@ fn publish_all(connection: &Connection, state: &State) -> anyhow::Result<()> {
         let lsp_uri: Uri = uri.parse().context("open uri")?;
         let params = PublishDiagnosticsParams {
             uri: lsp_uri,
-            diagnostics: handlers::diagnostics_for(&state.snapshot, uri),
+            diagnostics: handlers::diagnostics_for(&state.snapshot, state, uri, state.encoding),
             version: Some(doc.version),
         };
         connection
@@ -471,4 +508,65 @@ fn publish_clear(connection: &Connection, uri: &str) -> anyhow::Result<()> {
         )))
         .context("clear diagnostics")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lsp_server::Notification as WireNotification;
+
+    fn state() -> (
+        State,
+        crossbeam_channel::Receiver<ReindexReq>,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.py"), "def greet(): pass\n").unwrap();
+        let (req_tx, req_rx) = crossbeam_channel::unbounded();
+        let state = State::new(dir.path().to_path_buf(), req_tx, Encoding::Utf16).unwrap();
+        (state, req_rx, dir)
+    }
+
+    fn did_open(uri: &str, language_id: &str) -> WireNotification {
+        WireNotification {
+            method: notification::DidOpenTextDocument::METHOD.to_string(),
+            params: serde_json::json!({
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": language_id,
+                    "version": 1,
+                    "text": "x = 1\n",
+                }
+            }),
+        }
+    }
+
+    #[test]
+    fn cold_start_builds_index() {
+        let (state, _rx, _dir) = state();
+        assert_eq!(state.snapshot.extractions.len(), 1);
+        assert!(
+            state.snapshot.extractions[0]
+                .symbols
+                .iter()
+                .any(|s| s.name == "greet")
+        );
+    }
+
+    #[test]
+    fn did_open_unknown_language_skips_reindex() {
+        let (mut state, rx, _dir) = state();
+        handle_notification(&mut state, did_open("file:///notes.txt", "plaintext"));
+        assert!(state.buffers.get("file:///notes.txt").is_none());
+        assert!(rx.try_recv().is_err(), "no reindex expected");
+    }
+
+    #[test]
+    fn did_open_supported_language_requests_reindex() {
+        let (mut state, rx, _dir) = state();
+        handle_notification(&mut state, did_open("file:///a.py", "python"));
+        assert!(state.buffers.get("file:///a.py").is_some());
+        assert!(rx.try_recv().is_ok(), "reindex expected");
+    }
+
 }
