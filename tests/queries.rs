@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -17,12 +18,14 @@ const EMOJI_TS: &str =
 /// Test source lookup. Mirrors the server: overlay text wins over disk.
 struct TestSources {
     overlay: HashMap<PathBuf, String>,
+    reads: Cell<usize>,
 }
 
 impl TestSources {
     fn disk() -> Self {
         Self {
             overlay: HashMap::new(),
+            reads: Cell::new(0),
         }
     }
 
@@ -33,12 +36,16 @@ impl TestSources {
                 overlay.insert(path, doc.text.clone());
             }
         }
-        Self { overlay }
+        Self {
+            overlay,
+            reads: Cell::new(0),
+        }
     }
 }
 
 impl SourceText for TestSources {
     fn source(&self, path: &Path) -> Option<Cow<'_, str>> {
+        self.reads.set(self.reads.get() + 1);
         if let Some(text) = self.overlay.get(path) {
             return Some(Cow::Borrowed(text.as_str()));
         }
@@ -232,4 +239,233 @@ fn ranges_follow_negotiated_encoding() {
         )
         .is_some()
     );
+}
+
+const UTIL: &str = "def helper(value):\n    return value\n";
+const APP_IMPORT: &str = "from util import helper\n\n\ndef run():\n    return helper(1)\n";
+
+#[test]
+fn cross_file_definition_and_references() {
+    let dir = tempfile::tempdir().unwrap();
+    let util = dir.path().join("util.py");
+    let app = dir.path().join("app.py");
+    std::fs::write(&util, UTIL).unwrap();
+    std::fs::write(&app, APP_IMPORT).unwrap();
+    let snapshot = snapshot(dir.path(), &BufferStore::default());
+    let sources = TestSources::disk();
+
+    // The call in app.py resolves to the definition in util.py.
+    let location = handlers::definition_at(
+        &snapshot,
+        &sources,
+        uri_of(&app).as_str(),
+        pos(4, 13),
+        Encoding::Utf16,
+    )
+    .expect("definition");
+    assert_eq!(location.uri.as_str(), uri_of(&util).as_str());
+    assert_eq!(location.range.start.line, 0);
+
+    // The per-request cache must read each distinct file once.
+    sources.reads.set(0);
+    // References from the definition include the declaration and the call.
+    let references = handlers::references_at(
+        &snapshot,
+        &sources,
+        uri_of(&util).as_str(),
+        pos(0, 6),
+        Encoding::Utf16,
+        true,
+    );
+    assert!(
+        references
+            .iter()
+            .any(|location| location.uri.as_str() == uri_of(&app).as_str())
+    );
+    assert!(
+        references
+            .iter()
+            .any(|location| location.uri.as_str() == uri_of(&util).as_str())
+    );
+    assert_eq!(sources.reads.get(), 2);
+}
+
+#[test]
+fn repeated_references_collapse_to_one_edge() {
+    let dir = tempfile::tempdir().unwrap();
+    let util = dir.path().join("util.py");
+    let app = dir.path().join("app.py");
+    std::fs::write(&util, "def helper(value):\n    return value\n").unwrap();
+    std::fs::write(
+        &app,
+        "from util import helper\n\n\ndef run():\n    a = helper(1)\n    b = helper(2)\n    return a + b\n",
+    )
+    .unwrap();
+    let snapshot = snapshot(dir.path(), &BufferStore::default());
+    let sources = TestSources::disk();
+
+    let helper = snapshot
+        .symbols()
+        .find(|symbol| symbol.name == "helper")
+        .expect("helper");
+    let run = snapshot
+        .symbols()
+        .find(|symbol| symbol.name == "run")
+        .expect("run");
+
+    // Two use sites from one caller collapse to a single edge. The graph
+    // max-merges confidence for the same (source, target) pair.
+    let callers: Vec<_> = snapshot
+        .references_in(helper.id)
+        .iter()
+        .filter(|(id, _)| *id == run.id)
+        .collect();
+    assert_eq!(callers.len(), 1, "two use sites must collapse to one edge");
+    assert_eq!(callers[0].1, 1.0);
+
+    let references = handlers::references_at(
+        &snapshot,
+        &sources,
+        uri_of(&util).as_str(),
+        pos(0, 6),
+        Encoding::Utf16,
+        true,
+    );
+    assert_eq!(
+        references.len(),
+        2,
+        "declaration plus one collapsed use site"
+    );
+}
+
+#[test]
+fn workspace_symbols_read_each_file_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let alpha_beta = dir.path().join("alpha_beta.py");
+    let gamma = dir.path().join("gamma.py");
+    std::fs::write(&alpha_beta, "def alpha(): pass\n\n\ndef beta(): pass\n").unwrap();
+    std::fs::write(&gamma, "def gamma(): pass\n").unwrap();
+    let snapshot = snapshot(dir.path(), &BufferStore::default());
+    let sources = TestSources::disk();
+
+    let symbols = handlers::workspace_symbols(&snapshot, &sources, "", Encoding::Utf16);
+    let mut names: Vec<&str> = symbols.iter().map(|symbol| symbol.name.as_str()).collect();
+    names.sort_unstable();
+    assert_eq!(names, ["alpha", "beta", "gamma"]);
+    assert_eq!(sources.reads.get(), 2);
+}
+
+#[test]
+fn completion_matches_case_insensitively_when_exact_matches_are_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = dir.path().join("cased.py");
+    std::fs::write(
+        &app,
+        "def GREET(): pass\n\n\ndef use_greeting():\n    selection = gre\n",
+    )
+    .unwrap();
+    let snapshot = snapshot(dir.path(), &BufferStore::default());
+    let sources = TestSources::disk();
+
+    let items = handlers::completion_at(
+        &snapshot,
+        &sources,
+        uri_of(&app).as_str(),
+        pos(4, 15),
+        Encoding::Utf16,
+    );
+    let item = items
+        .iter()
+        .find(|item| item.label == "GREET")
+        .expect("case-insensitive completion");
+    assert_eq!(item.sort_text.as_deref(), Some("0GREET"));
+}
+
+#[test]
+fn workspace_symbols_filter_by_query() {
+    let (dir, _, _) = workspace();
+    let snapshot = snapshot(dir.path(), &BufferStore::default());
+    let sources = TestSources::disk();
+
+    let all = handlers::workspace_symbols(&snapshot, &sources, "", Encoding::Utf16);
+    assert!(all.iter().any(|symbol| symbol.name == "greet"));
+    assert!(all.iter().any(|symbol| symbol.name == "add"));
+
+    let filtered = handlers::workspace_symbols(&snapshot, &sources, "gre", Encoding::Utf16);
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].name, "greet");
+}
+
+#[test]
+fn completion_lists_visible_symbols() {
+    let (dir, app, _) = workspace();
+    let snapshot = snapshot(dir.path(), &BufferStore::default());
+    let sources = TestSources::disk();
+
+    // Cursor after `def gre` on line 0: prefix "gre".
+    let items = handlers::completion_at(
+        &snapshot,
+        &sources,
+        uri_of(&app).as_str(),
+        pos(0, 7),
+        Encoding::Utf16,
+    );
+    assert!(items.iter().any(|item| item.label == "greet"));
+    assert!(items.iter().all(|item| {
+        item.sort_text
+            .as_deref()
+            .is_some_and(|sort| sort.starts_with(['0', '1', '2']))
+    }));
+}
+
+const MIXED_JS: &str = "'use strict';\n\nfunction multiply(a, b) {\n\treturn a * b;\n}\n\nmodule.exports = { multiply };\n";
+const MIXED_PY: &str = "from metacall import metacall, metacall_load_from_file\n\nmetacall_load_from_file(\"node\", [\"math.js\"])\n\n\ndef compute_total(units, price):\n    return metacall(\"multiply\", units, price)\n";
+
+#[test]
+fn metacall_cross_language_definition_and_references() {
+    let dir = tempfile::tempdir().unwrap();
+    let js = dir.path().join("math.js");
+    let py = dir.path().join("orchestrator.py");
+    std::fs::write(&js, MIXED_JS).unwrap();
+    std::fs::write(&py, MIXED_PY).unwrap();
+    let snapshot = snapshot(dir.path(), &BufferStore::default());
+    let sources = TestSources::disk();
+
+    // The metacall("multiply", ...) call resolves to the JavaScript function.
+    let location = handlers::definition_at(
+        &snapshot,
+        &sources,
+        uri_of(&py).as_str(),
+        pos(6, 25),
+        Encoding::Utf16,
+    )
+    .expect("definition");
+    assert_eq!(location.uri.as_str(), uri_of(&js).as_str());
+    assert_eq!(location.range.start.line, 2);
+
+    // References from the definition include the orchestrator call site.
+    let references = handlers::references_at(
+        &snapshot,
+        &sources,
+        uri_of(&js).as_str(),
+        pos(2, 12),
+        Encoding::Utf16,
+        true,
+    );
+    assert!(
+        references
+            .iter()
+            .any(|location| location.uri.as_str() == uri_of(&py).as_str())
+    );
+
+    // Completion inside the metacall("multiply", ...) call offers the target.
+    // The cursor sits after "mu", so the prefix is "mu".
+    let items = handlers::completion_at(
+        &snapshot,
+        &sources,
+        uri_of(&py).as_str(),
+        pos(6, 23),
+        Encoding::Utf16,
+    );
+    assert!(items.iter().any(|item| item.label == "multiply"));
 }

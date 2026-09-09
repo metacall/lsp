@@ -16,7 +16,7 @@ name = "meta_call_lsp"
 path = "src/lib.rs"
 
 [dependencies]
-meta-ast = "0.5.1"
+meta-ast = { version = "0.6.0", features = ["metacall-deploy"] }
 crossbeam-channel = "0.5"
 lsp-server = "0.10"
 lsp-types = "0.97"

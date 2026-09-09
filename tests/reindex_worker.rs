@@ -65,7 +65,7 @@ fn burst_coalesces_to_latest() {
     assert!(buffers.open(uri.as_str(), 1, "python", APP.to_string()));
     let (req_tx, req_rx) = crossbeam_channel::unbounded();
     let (resp_tx, resp_rx) = crossbeam_channel::unbounded();
-    let worker = spawn_worker(req_rx, resp_tx);
+    let worker = spawn_worker(req_rx, resp_tx, index::Reindexer::new());
     for version in 2..=6 {
         assert!(buffers.open(
             uri.as_str(),
@@ -99,7 +99,7 @@ fn readers_hold_old_snapshot_during_reindex() {
     );
     let (req_tx, req_rx) = crossbeam_channel::unbounded();
     let (resp_tx, resp_rx) = crossbeam_channel::unbounded();
-    let worker = spawn_worker(req_rx, resp_tx);
+    let worker = spawn_worker(req_rx, resp_tx, index::Reindexer::new());
     let mut next = BufferStore::default();
     assert!(next.open(
         uri.as_str(),
