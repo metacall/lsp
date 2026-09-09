@@ -11,11 +11,13 @@ use lsp_server::{Notification as WireNotification, Request as WireRequest, Reque
 use lsp_types::notification::Notification as LspNotification;
 use lsp_types::request::Request as LspRequest;
 use lsp_types::{
-    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    DidSaveTextDocumentParams, DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams,
+    DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
+    DidChangeWatchedFilesRegistrationOptions, DidCloseTextDocumentParams,
+    DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentSymbolParams,
+    DocumentSymbolResponse, FileSystemWatcher, GlobPattern, GotoDefinitionParams,
     GotoDefinitionResponse, HoverParams, HoverProviderCapability, InitializeParams, OneOf,
-    PublishDiagnosticsParams, ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind,
-    Uri,
+    PublishDiagnosticsParams, Registration, RegistrationParams, ServerCapabilities,
+    TextDocumentSyncCapability, TextDocumentSyncKind, Uri,
 };
 use lsp_types::{notification, request};
 
@@ -52,6 +54,15 @@ pub fn run() -> anyhow::Result<()> {
         )
         .context("send initialize result")?;
     tracing::info!(root = %root.display(), ?encoding, "serving");
+    if supports_watched_files(&params.capabilities) {
+        if let Err(error) = register_watched_files(&connection) {
+            tracing::warn!(%error, "watched files registration failed");
+        }
+    } else {
+        tracing::info!(
+            "client has no dynamic watched-file registration; external changes stay untracked"
+        );
+    }
     let (req_tx, req_rx) = crossbeam_channel::unbounded();
     let (resp_tx, resp_rx) = crossbeam_channel::unbounded();
     let worker = reindex::spawn_worker(req_rx, resp_tx);
@@ -291,6 +302,60 @@ fn capabilities(encoding: Encoding) -> ServerCapabilities {
     }
 }
 
+/// Dynamic registration is the only portable way to receive external changes.
+fn supports_watched_files(caps: &lsp_types::ClientCapabilities) -> bool {
+    caps.workspace
+        .as_ref()
+        .and_then(|workspace| workspace.did_change_watched_files.as_ref())
+        .and_then(|watched| watched.dynamic_registration)
+        .unwrap_or(false)
+}
+
+/// Glob patterns for every extension meta-ast can parse.
+fn watched_globs() -> Vec<String> {
+    let mut globs = Vec::new();
+    for lang in meta_ast::LangId::all() {
+        for extension in meta_ast::language::spec_for(lang).extensions {
+            globs.push(format!("**/*.{extension}"));
+        }
+    }
+    globs.sort();
+    globs.dedup();
+    globs
+}
+
+fn register_watched_files(connection: &Connection) -> anyhow::Result<()> {
+    let params = watched_files_registration()?;
+    let request = WireRequest {
+        id: RequestId::from("meta-ast-lsp-register-watched-files".to_string()),
+        method: request::RegisterCapability::METHOD.to_string(),
+        params: serde_json::to_value(params)?,
+    };
+    connection
+        .sender
+        .send(Message::Request(request))
+        .context("send registerCapability")?;
+    Ok(())
+}
+
+fn watched_files_registration() -> anyhow::Result<RegistrationParams> {
+    let watchers = watched_globs()
+        .into_iter()
+        .map(|glob| FileSystemWatcher {
+            glob_pattern: GlobPattern::String(glob),
+            kind: None,
+        })
+        .collect();
+    let options = DidChangeWatchedFilesRegistrationOptions { watchers };
+    Ok(RegistrationParams {
+        registrations: vec![Registration {
+            id: "meta-ast-lsp-watched-files".to_string(),
+            method: notification::DidChangeWatchedFiles::METHOD.to_string(),
+            register_options: Some(serde_json::to_value(options)?),
+        }],
+    })
+}
+
 fn root_from_params(params: &InitializeParams) -> anyhow::Result<PathBuf> {
     if let Some(folders) = &params.workspace_folders
         && let Some(folder) = folders.first()
@@ -438,6 +503,21 @@ fn handle_notification(state: &mut State, notification: WireNotification) -> Opt
             state.flush();
         }
         None
+    } else if method == notification::DidChangeWatchedFiles::METHOD {
+        let Ok(params) = serde_json::from_value::<DidChangeWatchedFilesParams>(params) else {
+            tracing::warn!("bad didChangeWatchedFiles params");
+            return None;
+        };
+        let relevant = params.changes.iter().any(|event| {
+            convert::uri_to_path(event.uri.as_str())
+                .filter(|path| path.starts_with(&state.root))
+                .and_then(|path| meta_ast::detect_language(&path))
+                .is_some()
+        });
+        if relevant {
+            state.schedule(true);
+        }
+        None
     } else {
         None
     }
@@ -569,4 +649,54 @@ mod tests {
         assert!(rx.try_recv().is_ok(), "reindex expected");
     }
 
+    fn watched(uri: &str) -> WireNotification {
+        WireNotification {
+            method: notification::DidChangeWatchedFiles::METHOD.to_string(),
+            params: serde_json::json!({
+                "changes": [ { "uri": uri, "type": 2 } ]
+            }),
+        }
+    }
+
+    #[test]
+    fn watched_globs_cover_supported_extensions() {
+        let globs = watched_globs();
+        assert!(globs.iter().any(|glob| glob == "**/*.py"));
+        assert!(globs.iter().any(|glob| glob == "**/*.ts"));
+    }
+
+    #[test]
+    fn watched_files_registration_is_well_formed() {
+        let params = watched_files_registration().unwrap();
+        let value = serde_json::to_value(&params).unwrap();
+        let registration = &value["registrations"][0];
+        assert_eq!(registration["method"], "workspace/didChangeWatchedFiles");
+        let watchers = registration["registerOptions"]["watchers"]
+            .as_array()
+            .unwrap();
+        assert!(watchers.len() > 1);
+    }
+
+    #[test]
+    fn watched_source_change_requests_reindex() {
+        let (mut state, rx, dir) = state();
+        let uri = convert::path_to_uri(&dir.path().join("a.py")).unwrap();
+        handle_notification(&mut state, watched(uri.as_str()));
+        assert!(rx.try_recv().is_ok(), "reindex expected");
+    }
+
+    #[test]
+    fn watched_change_outside_root_is_ignored() {
+        let (mut state, rx, _dir) = state();
+        handle_notification(&mut state, watched("file:///elsewhere/a.py"));
+        assert!(rx.try_recv().is_err(), "no reindex expected");
+    }
+
+    #[test]
+    fn watched_change_for_unsupported_extension_is_ignored() {
+        let (mut state, rx, dir) = state();
+        let uri = convert::path_to_uri(&dir.path().join("README.md")).unwrap();
+        handle_notification(&mut state, watched(uri.as_str()));
+        assert!(rx.try_recv().is_err(), "no reindex expected");
+    }
 }
