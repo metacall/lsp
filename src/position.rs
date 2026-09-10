@@ -45,30 +45,6 @@ fn units_of(ch: char, encoding: Encoding) -> usize {
     }
 }
 
-/// Byte offset of the first character of `line`. None when the line is absent.
-fn line_start(text: &str, line: u32) -> Option<usize> {
-    if line == 0 {
-        return Some(0);
-    }
-    let mut seen = 0u32;
-    for (index, _) in text.match_indices('\n') {
-        seen += 1;
-        if seen == line {
-            return Some(index + 1);
-        }
-    }
-    None
-}
-
-/// Line content without the trailing newline.
-fn line_content(text: &str, start: usize) -> &str {
-    let rest = &text[start..];
-    match rest.find('\n') {
-        Some(end) => &rest[..end],
-        None => rest,
-    }
-}
-
 fn clamp_boundary(text: &str, byte: usize) -> usize {
     let mut byte = byte.min(text.len());
     while !text.is_char_boundary(byte) {
@@ -77,57 +53,113 @@ fn clamp_boundary(text: &str, byte: usize) -> usize {
     byte
 }
 
-/// Convert an LSP position to a byte offset.
-pub fn to_byte_offset(text: &str, pos: Position, encoding: Encoding) -> Option<usize> {
-    let start = line_start(text, pos.line)?;
-    let line = line_content(text, start);
-    let target = pos.character as usize;
-    let mut units = 0usize;
-    for (index, ch) in line.char_indices() {
-        if units >= target {
-            return Some(start + index);
-        }
-        let next = units + units_of(ch, encoding);
-        if next > target {
-            return Some(start + index);
-        }
-        units = next;
-    }
-    Some(start + line.len())
+/// Precomputed line starts for one text buffer.
+///
+/// Building the index costs one scan of the text. Each conversion after that
+/// costs O(log lines) plus the characters on one line.
+#[derive(Debug)]
+pub struct LineIndex {
+    starts: Vec<usize>,
 }
 
-/// Convert a byte offset to an LSP position.
-fn to_position(text: &str, byte: usize, encoding: Encoding) -> Position {
-    let byte = clamp_boundary(text, byte);
-    let line = text[..byte].matches('\n').count() as u32;
-    let start = line_start(text, line).unwrap_or(0);
-    let character = text[start..byte]
-        .chars()
-        .map(|ch| units_of(ch, encoding))
-        .sum::<usize>();
-    Position {
-        line,
-        character: u32::try_from(character).unwrap_or(u32::MAX),
+impl LineIndex {
+    /// Scan the text once and record the byte offset of every line start.
+    pub fn new(text: &str) -> Self {
+        let mut starts = Vec::new();
+        starts.push(0);
+        for (index, byte) in text.bytes().enumerate() {
+            if byte == b'\n' {
+                starts.push(index + 1);
+            }
+        }
+        Self { starts }
     }
+
+    fn line_start(&self, line: u32) -> Option<usize> {
+        self.starts.get(line as usize).copied()
+    }
+
+    fn line_end(&self, text: &str, start: usize) -> usize {
+        match text[start..].find('\n') {
+            Some(offset) => start + offset,
+            None => text.len(),
+        }
+    }
+
+    /// Convert an LSP position to a byte offset.
+    pub fn to_byte_offset(&self, text: &str, pos: Position, encoding: Encoding) -> Option<usize> {
+        let start = self.line_start(pos.line)?;
+        let end = self.line_end(text, start);
+        let line = &text[start..end];
+        let target = pos.character as usize;
+        let mut units = 0usize;
+        for (index, ch) in line.char_indices() {
+            if units >= target {
+                return Some(start + index);
+            }
+            let next = units + units_of(ch, encoding);
+            if next > target {
+                return Some(start + index);
+            }
+            units = next;
+        }
+        Some(end)
+    }
+
+    /// Convert a byte offset to an LSP position.
+    pub fn to_position(&self, text: &str, byte: usize, encoding: Encoding) -> Position {
+        let byte = clamp_boundary(text, byte);
+        let line = self
+            .starts
+            .partition_point(|&start| start <= byte)
+            .saturating_sub(1);
+        let start = self.starts[line];
+        let character = text[start..byte]
+            .chars()
+            .map(|ch| units_of(ch, encoding))
+            .sum::<usize>();
+        Position {
+            line: u32::try_from(line).unwrap_or(u32::MAX),
+            character: u32::try_from(character).unwrap_or(u32::MAX),
+        }
+    }
+
+    /// Convert a meta-ast byte range to an LSP range.
+    pub fn range(&self, text: &str, range: &SourceRange, encoding: Encoding) -> Range {
+        Range {
+            start: self.to_position(text, range.byte_start, encoding),
+            end: self.to_position(text, range.byte_end, encoding),
+        }
+    }
+}
+
+/// Fallback range when source text is unavailable: byte columns pass through.
+pub fn range_without_text(range: &SourceRange) -> Range {
+    Range {
+        start: Position {
+            line: u32::try_from(range.start.line).unwrap_or(u32::MAX),
+            character: u32::try_from(range.start.column).unwrap_or(u32::MAX),
+        },
+        end: Position {
+            line: u32::try_from(range.end.line).unwrap_or(u32::MAX),
+            character: u32::try_from(range.end.column).unwrap_or(u32::MAX),
+        },
+    }
+}
+
+/// Convert an LSP position to a byte offset.
+///
+/// Builds a line index for the call. Use [`LineIndex`] directly when the same
+/// text serves several conversions.
+pub fn to_byte_offset(text: &str, pos: Position, encoding: Encoding) -> Option<usize> {
+    LineIndex::new(text).to_byte_offset(text, pos, encoding)
 }
 
 /// Convert a meta-ast byte range to an LSP range.
 pub fn range(text: Option<&str>, range: &SourceRange, encoding: Encoding) -> Range {
     match text {
-        Some(text) => Range {
-            start: to_position(text, range.byte_start, encoding),
-            end: to_position(text, range.byte_end, encoding),
-        },
-        None => Range {
-            start: Position {
-                line: u32::try_from(range.start.line).unwrap_or(u32::MAX),
-                character: u32::try_from(range.start.column).unwrap_or(u32::MAX),
-            },
-            end: Position {
-                line: u32::try_from(range.end.line).unwrap_or(u32::MAX),
-                character: u32::try_from(range.end.column).unwrap_or(u32::MAX),
-            },
-        },
+        Some(text) => LineIndex::new(text).range(text, range, encoding),
+        None => range_without_text(range),
     }
 }
 
@@ -148,6 +180,10 @@ mod tests {
 
     fn pos(line: u32, character: u32) -> Position {
         Position { line, character }
+    }
+
+    fn position(text: &str, byte: usize, encoding: Encoding) -> Position {
+        LineIndex::new(text).to_position(text, byte, encoding)
     }
 
     #[test]
@@ -177,9 +213,16 @@ mod tests {
     #[test]
     fn ascii_offsets_are_stable() {
         let text = "abc\ndef\n";
-        assert_eq!(to_byte_offset(text, pos(0, 2), Encoding::Utf16), Some(2));
-        assert_eq!(to_byte_offset(text, pos(1, 1), Encoding::Utf16), Some(5));
-        assert_eq!(to_position(text, 5, Encoding::Utf16), pos(1, 1));
+        let index = LineIndex::new(text);
+        assert_eq!(
+            index.to_byte_offset(text, pos(0, 2), Encoding::Utf16),
+            Some(2)
+        );
+        assert_eq!(
+            index.to_byte_offset(text, pos(1, 1), Encoding::Utf16),
+            Some(5)
+        );
+        assert_eq!(index.to_position(text, 5, Encoding::Utf16), pos(1, 1));
     }
 
     #[test]
@@ -187,21 +230,22 @@ mod tests {
         // "🐍" is 4 UTF-8 bytes and 2 UTF-16 code units.
         let text = "x = \"🐍\"\n";
         let snake = text.find('🐍').unwrap();
-        assert_eq!(to_position(text, snake, Encoding::Utf8), pos(0, 5));
-        assert_eq!(to_position(text, snake, Encoding::Utf16), pos(0, 5));
+        assert_eq!(position(text, snake, Encoding::Utf8), pos(0, 5));
+        assert_eq!(position(text, snake, Encoding::Utf16), pos(0, 5));
         let after = snake + '🐍'.len_utf8();
-        assert_eq!(to_position(text, after, Encoding::Utf8), pos(0, 9));
-        assert_eq!(to_position(text, after, Encoding::Utf16), pos(0, 7));
+        assert_eq!(position(text, after, Encoding::Utf8), pos(0, 9));
+        assert_eq!(position(text, after, Encoding::Utf16), pos(0, 7));
     }
 
     #[test]
     fn multibyte_round_trip() {
         let text = "é中🐍 = 1\n";
+        let index = LineIndex::new(text);
         for encoding in [Encoding::Utf8, Encoding::Utf16] {
             for (byte, _) in text.char_indices() {
-                let position = to_position(text, byte, encoding);
+                let position = index.to_position(text, byte, encoding);
                 assert_eq!(
-                    to_byte_offset(text, position, encoding),
+                    index.to_byte_offset(text, position, encoding),
                     Some(byte),
                     "encoding {encoding:?} byte {byte}"
                 );
@@ -212,21 +256,51 @@ mod tests {
     #[test]
     fn column_past_line_end_clamps() {
         let text = "ab\ncd\n";
-        assert_eq!(to_byte_offset(text, pos(0, 99), Encoding::Utf16), Some(2));
-        assert_eq!(to_byte_offset(text, pos(1, 99), Encoding::Utf16), Some(5));
+        let index = LineIndex::new(text);
+        assert_eq!(
+            index.to_byte_offset(text, pos(0, 99), Encoding::Utf16),
+            Some(2)
+        );
+        assert_eq!(
+            index.to_byte_offset(text, pos(1, 99), Encoding::Utf16),
+            Some(5)
+        );
     }
 
     #[test]
     fn missing_line_returns_none() {
         let text = "ab\n";
-        assert_eq!(to_byte_offset(text, pos(5, 0), Encoding::Utf16), None);
+        let index = LineIndex::new(text);
+        assert_eq!(index.to_byte_offset(text, pos(5, 0), Encoding::Utf16), None);
     }
 
     #[test]
     fn position_inside_character_snaps_to_start() {
         let text = "🐍\n";
+        let index = LineIndex::new(text);
         // UTF-16 column 1 is inside the surrogate pair.
-        assert_eq!(to_byte_offset(text, pos(0, 1), Encoding::Utf16), Some(0));
+        assert_eq!(
+            index.to_byte_offset(text, pos(0, 1), Encoding::Utf16),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn line_index_locates_bytes_across_many_lines() {
+        let mut text = String::new();
+        for line in 0..500 {
+            text.push_str(&format!("line {line}\n"));
+        }
+        let index = LineIndex::new(&text);
+        let target = text.find("line 321").expect("line 321");
+        assert_eq!(
+            index.to_position(&text, target, Encoding::Utf16),
+            pos(321, 0)
+        );
+        assert_eq!(
+            index.to_byte_offset(&text, pos(321, 5), Encoding::Utf16),
+            Some(target + 5)
+        );
     }
 
     #[test]
@@ -239,7 +313,7 @@ mod tests {
             end: meta_ast::model::LineColumn { line: 0, column: 9 },
         };
         assert_eq!(
-            range(Some(text), &source_range, Encoding::Utf16),
+            LineIndex::new(text).range(text, &source_range, Encoding::Utf16),
             Range {
                 start: pos(0, 5),
                 end: pos(0, 7)
