@@ -38,6 +38,15 @@ use crate::reindex::{self, ReindexReq, ReindexResp};
 const SERVER_NAME: &str = "meta-ast-lsp";
 const PROGRESS_THRESHOLD_MS: u128 = 500;
 
+/// Files whose contents shape engine resolver state for the process lifetime.
+const RESOLVER_CONFIGS: [&str; 5] = [
+    "tsconfig.json",
+    "jsconfig.json",
+    "go.mod",
+    "pyproject.toml",
+    "package.json",
+];
+
 pub fn run() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -437,13 +446,17 @@ fn supports_watched_files(caps: &lsp_types::ClientCapabilities) -> bool {
         .unwrap_or(false)
 }
 
-/// Glob patterns for every extension meta-ast can parse.
+/// Glob patterns for every extension meta-ast can parse, plus resolver
+/// configuration files.
 fn watched_globs() -> Vec<String> {
     let mut globs = Vec::new();
     for lang in meta_ast::LangId::all() {
         for extension in meta_ast::language::spec_for(lang).extensions {
             globs.push(format!("**/*.{extension}"));
         }
+    }
+    for name in RESOLVER_CONFIGS {
+        globs.push(format!("**/{name}"));
     }
     globs.sort();
     globs.dedup();
@@ -854,6 +867,13 @@ mod tests {
         let globs = watched_globs();
         assert!(globs.iter().any(|glob| glob == "**/*.py"));
         assert!(globs.iter().any(|glob| glob == "**/*.ts"));
+    }
+
+    #[test]
+    fn watched_globs_cover_resolver_configs() {
+        let globs = watched_globs();
+        assert!(globs.iter().any(|glob| glob == "**/tsconfig.json"));
+        assert!(globs.iter().any(|glob| glob == "**/go.mod"));
     }
 
     #[test]
