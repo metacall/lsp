@@ -3,7 +3,7 @@ use std::borrow::Cow;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use crossbeam_channel::{Receiver, Sender, select};
@@ -38,6 +38,7 @@ use crate::reindex::{self, ReindexReq, ReindexResp};
 
 const SERVER_NAME: &str = "meta-ast-lsp";
 const PROGRESS_THRESHOLD_MS: u128 = 500;
+const IDLE_TIMEOUT: Duration = Duration::from_secs(3600);
 
 /// Files whose contents shape engine resolver state for the process lifetime.
 const RESOLVER_CONFIGS: [&str; 5] = [
@@ -103,85 +104,27 @@ pub fn run_connection(connection: Connection) -> anyhow::Result<()> {
     let mut state = State::new(root, req_tx, encoding, first, progress_supported);
     let mut shutdown = false;
     'serve: loop {
-        if let Some(remaining) = state.pending_remaining() {
-            select! {
-                recv(connection.receiver) -> msg => {
-                    let Ok(msg) = msg else { break 'serve };
-                    match msg {
-                        Message::Request(request) => {
-                            if connection
-                                .handle_shutdown(&request)
-                                .context("answer shutdown")?
-                            {
-                                shutdown = true;
-                                break 'serve;
-                            }
-                            handle_request(&connection, &mut state, request);
-                        }
-                        Message::Notification(notification) => {
-                            if notification.method == "exit" {
-                                break 'serve;
-                            }
-                            if let Some(uri) = handle_notification(&connection, &mut state, notification)
-                                && let Err(error) = publish_clear(&connection, uri.as_str())
-                            {
-                                tracing::warn!(%error, "clear failed");
-                            }
-                            state.pump_progress(&connection);
-                        }
-                        Message::Response(_) => {}
+        let timeout = state.pending_remaining().unwrap_or(IDLE_TIMEOUT);
+        select! {
+            recv(connection.receiver) -> msg => {
+                let Ok(msg) = msg else { break 'serve };
+                match handle_client_message(&connection, &mut state, msg)? {
+                    LoopControl::Continue => {}
+                    LoopControl::Shutdown => {
+                        shutdown = true;
+                        break 'serve;
                     }
-                }
-                recv(resp_rx) -> resp => {
-                    let Ok(resp) = resp else {
-                        worker_gone(&connection, &mut state, true);
-                        continue 'serve;
-                    };
-                    apply_resp(&connection, &mut state, resp);
-                }
-                default(remaining) => {
-                    state.flush();
-                    state.pump_progress(&connection);
-                    drain_resps(&connection, &mut state, &resp_rx);
+                    LoopControl::Exit => break 'serve,
                 }
             }
-        } else {
-            select! {
-                recv(connection.receiver) -> msg => {
-                    let Ok(msg) = msg else { break 'serve };
-                    match msg {
-                        Message::Request(request) => {
-                            if connection
-                                .handle_shutdown(&request)
-                                .context("answer shutdown")?
-                            {
-                                shutdown = true;
-                                break 'serve;
-                            }
-                            handle_request(&connection, &mut state, request);
-                        }
-                        Message::Notification(notification) => {
-                            if notification.method == "exit" {
-                                break 'serve;
-                            }
-                            if let Some(uri) = handle_notification(&connection, &mut state, notification)
-                                && let Err(error) = publish_clear(&connection, uri.as_str())
-                            {
-                                tracing::warn!(%error, "clear failed");
-                            }
-                            state.pump_progress(&connection);
-                        }
-                        Message::Response(_) => {}
-                    }
-                }
-                recv(resp_rx) -> resp => {
-                    let Ok(resp) = resp else {
-                        worker_gone(&connection, &mut state, false);
-                        continue 'serve;
-                    };
-                    apply_resp(&connection, &mut state, resp);
-                }
+            recv(resp_rx) -> resp => {
+                let Ok(resp) = resp else {
+                    worker_gone(&connection, &mut state);
+                    continue 'serve;
+                };
+                apply_resp(&connection, &mut state, resp);
             }
+            default(timeout) => {}
         }
         drain_resps(&connection, &mut state, &resp_rx);
         if state.flush_due() {
@@ -195,6 +138,45 @@ pub fn run_connection(connection: Connection) -> anyhow::Result<()> {
         tracing::warn!("client exited without shutdown");
     }
     Ok(())
+}
+
+/// Control flow returned by a handled client message.
+enum LoopControl {
+    Continue,
+    Shutdown,
+    Exit,
+}
+
+fn handle_client_message(
+    connection: &Connection,
+    state: &mut State,
+    message: Message,
+) -> anyhow::Result<LoopControl> {
+    match message {
+        Message::Request(request) => {
+            if connection
+                .handle_shutdown(&request)
+                .context("answer shutdown")?
+            {
+                return Ok(LoopControl::Shutdown);
+            }
+            handle_request(connection, state, request);
+            Ok(LoopControl::Continue)
+        }
+        Message::Notification(notification) => {
+            if notification.method == "exit" {
+                return Ok(LoopControl::Exit);
+            }
+            if let Some(uri) = handle_notification(connection, state, notification)
+                && let Err(error) = publish_clear(connection, uri.as_str())
+            {
+                tracing::warn!(%error, "clear failed");
+            }
+            state.pump_progress(connection);
+            Ok(LoopControl::Continue)
+        }
+        Message::Response(_) => Ok(LoopControl::Continue),
+    }
 }
 
 struct Pending {
@@ -376,11 +358,9 @@ impl SourceText for State {
     }
 }
 
-fn worker_gone(connection: &Connection, state: &mut State, clear_pending: bool) {
+fn worker_gone(connection: &Connection, state: &mut State) {
     tracing::warn!("reindex worker gone");
-    if clear_pending {
-        state.pending = None;
-    }
+    state.pending = None;
     state.end_progress(connection);
 }
 
@@ -1082,7 +1062,7 @@ mod tests {
         state.progress_seq = 4;
         state.progress_token = NumberOrString::String("meta-ast-reindex-4".to_string());
 
-        worker_gone(&server, &mut state, true);
+        worker_gone(&server, &mut state);
 
         assert!(!state.progress_active);
         let message = client
