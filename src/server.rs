@@ -52,6 +52,7 @@ const RESOLVER_CONFIGS: [&str; 5] = [
 pub fn run() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
         .init();
     meta_ast::language::validate_queries();
     let (connection, io_threads) = Connection::stdio();
