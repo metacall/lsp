@@ -198,8 +198,8 @@ struct State {
     encoding: Encoding,
     cancel: Cancellation,
     progress_supported: bool,
-    progress_active: bool,
-    progress_pending: bool,
+    progress_active: Option<u64>,
+    progress_pending: Option<u64>,
     progress_seq: u64,
     progress_token: NumberOrString,
     last_reindex_ms: u128,
@@ -227,8 +227,8 @@ impl State {
             encoding,
             cancel: Cancellation::default(),
             progress_supported,
-            progress_active: false,
-            progress_pending: false,
+            progress_active: None,
+            progress_pending: None,
             progress_seq: 0,
             progress_token: NumberOrString::String(String::new()),
             last_reindex_ms: 0,
@@ -255,8 +255,9 @@ impl State {
             overlays,
         };
         self.queue(req);
-        self.progress_pending =
-            self.progress_supported && self.last_reindex_ms > PROGRESS_THRESHOLD_MS;
+        self.progress_pending = (self.progress_supported
+            && self.last_reindex_ms > PROGRESS_THRESHOLD_MS)
+            .then_some(seq);
     }
 
     /// Send when the worker has room. Keep only the newest request otherwise.
@@ -279,13 +280,15 @@ impl State {
 
     /// Start a progress operation when the previous reindex was slow.
     fn pump_progress(&mut self, connection: &Connection) {
-        if self.progress_pending && !self.progress_active {
-            self.progress_pending = false;
-            self.start_progress(connection);
+        if let Some(seq) = self.progress_pending
+            && self.progress_active.is_none()
+        {
+            self.progress_pending = None;
+            self.start_progress(connection, seq);
         }
     }
 
-    fn start_progress(&mut self, connection: &Connection) {
+    fn start_progress(&mut self, connection: &Connection, seq: u64) {
         self.progress_seq += 1;
         let token = NumberOrString::String(format!("meta-ast-reindex-{}", self.progress_seq));
         let create = WireRequest {
@@ -312,12 +315,12 @@ impl State {
                 "$/progress".to_string(),
                 begin,
             )));
-        self.progress_active = true;
+        self.progress_active = Some(seq);
         self.progress_token = token;
     }
 
     fn end_progress(&mut self, connection: &Connection) {
-        if !self.progress_active {
+        if self.progress_active.take().is_none() {
             return;
         }
         let end = ProgressParams {
@@ -332,7 +335,6 @@ impl State {
                 "$/progress".to_string(),
                 end,
             )));
-        self.progress_active = false;
     }
 
     fn schedule(&mut self, immediate: bool) {
@@ -392,7 +394,6 @@ fn drain_resps(connection: &Connection, state: &mut State, resp_rx: &Receiver<Re
 
 fn apply_resp(connection: &Connection, state: &mut State, resp: ReindexResp) {
     if resp.seq <= state.applied_seq {
-        state.end_progress(connection);
         return;
     }
     state.applied_seq = resp.seq;
@@ -411,7 +412,9 @@ fn apply_resp(connection: &Connection, state: &mut State, resp: ReindexResp) {
         }
         Err(error) => tracing::warn!(%error, "reindex failed, keeping prior snapshot"),
     }
-    state.end_progress(connection);
+    if state.progress_active == Some(resp.seq) {
+        state.end_progress(connection);
+    }
 }
 
 fn capabilities(encoding: Encoding) -> ServerCapabilities {
@@ -1064,10 +1067,10 @@ mod tests {
     }
 
     #[test]
-    fn stale_reindex_response_ends_progress() {
+    fn stale_reindex_response_keeps_newest_progress() {
         let (server, client) = Connection::memory();
         let (mut state, _rx, _dir) = state();
-        state.progress_active = true;
+        state.progress_active = Some(5);
         state.progress_seq = 3;
         state.progress_token = NumberOrString::String("meta-ast-reindex-3".to_string());
         state.applied_seq = 5;
@@ -1082,7 +1085,35 @@ mod tests {
             },
         );
 
-        assert!(!state.progress_active);
+        assert_eq!(state.progress_active, Some(5));
+        assert!(
+            client
+                .receiver
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "stale response must not end the newest progress"
+        );
+    }
+
+    #[test]
+    fn matching_reindex_response_ends_progress() {
+        let (server, client) = Connection::memory();
+        let (mut state, _rx, _dir) = state();
+        state.progress_active = Some(2);
+        state.progress_seq = 1;
+        state.progress_token = NumberOrString::String("meta-ast-reindex-1".to_string());
+
+        apply_resp(
+            &server,
+            &mut state,
+            ReindexResp {
+                seq: 2,
+                elapsed_ms: 1,
+                result: Err(anyhow::anyhow!("reindex failed")),
+            },
+        );
+
+        assert!(state.progress_active.is_none());
         let message = client
             .receiver
             .recv_timeout(std::time::Duration::from_secs(5))
@@ -1094,24 +1125,21 @@ mod tests {
         let params: ProgressParams = serde_json::from_value(notification.params).unwrap();
         assert_eq!(
             params.token,
-            NumberOrString::String("meta-ast-reindex-3".to_string())
+            NumberOrString::String("meta-ast-reindex-1".to_string())
         );
-        let ProgressParamsValue::WorkDone(WorkDoneProgress::End(_)) = params.value else {
-            panic!("expected a progress end");
-        };
     }
 
     #[test]
     fn worker_disconnect_ends_progress() {
         let (server, client) = Connection::memory();
         let (mut state, _rx, _dir) = state();
-        state.progress_active = true;
+        state.progress_active = Some(4);
         state.progress_seq = 4;
         state.progress_token = NumberOrString::String("meta-ast-reindex-4".to_string());
 
         worker_gone(&server, &mut state);
 
-        assert!(!state.progress_active);
+        assert!(state.progress_active.is_none());
         let message = client
             .receiver
             .recv_timeout(std::time::Duration::from_secs(5))
