@@ -1,5 +1,6 @@
 //! Sync LSP loop.
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -17,12 +18,12 @@ use lsp_types::{
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
     DocumentSymbolParams, DocumentSymbolResponse, FileSystemWatcher, GlobPattern,
     GotoDefinitionParams, GotoDefinitionResponse, HoverParams, HoverProviderCapability,
-    InitializeParams, OneOf, ProgressParams, ProgressParamsValue, PublishDiagnosticsParams,
-    ReferenceParams, Registration, RegistrationParams, SaveOptions, ServerCapabilities,
-    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
-    TextDocumentSyncSaveOptions, Uri, WorkDoneProgress, WorkDoneProgressBegin,
-    WorkDoneProgressCreateParams, WorkDoneProgressEnd, WorkspaceSymbolParams,
-    WorkspaceSymbolResponse,
+    InitializeParams, MessageType, OneOf, ProgressParams, ProgressParamsValue,
+    PublishDiagnosticsParams, ReferenceParams, Registration, RegistrationParams, SaveOptions,
+    ServerCapabilities, ShowMessageParams, TextDocumentSyncCapability, TextDocumentSyncKind,
+    TextDocumentSyncOptions, TextDocumentSyncSaveOptions, Uri, WorkDoneProgress,
+    WorkDoneProgressBegin, WorkDoneProgressCreateParams, WorkDoneProgressEnd,
+    WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 use lsp_types::{notification, request};
 
@@ -121,7 +122,7 @@ pub fn run_connection(connection: Connection) -> anyhow::Result<()> {
                             if notification.method == "exit" {
                                 break 'serve;
                             }
-                            if let Some(uri) = handle_notification(&mut state, notification)
+                            if let Some(uri) = handle_notification(&connection, &mut state, notification)
                                 && let Err(error) = publish_clear(&connection, uri.as_str())
                             {
                                 tracing::warn!(%error, "clear failed");
@@ -163,7 +164,7 @@ pub fn run_connection(connection: Connection) -> anyhow::Result<()> {
                             if notification.method == "exit" {
                                 break 'serve;
                             }
-                            if let Some(uri) = handle_notification(&mut state, notification)
+                            if let Some(uri) = handle_notification(&connection, &mut state, notification)
                                 && let Err(error) = publish_clear(&connection, uri.as_str())
                             {
                                 tracing::warn!(%error, "clear failed");
@@ -219,6 +220,7 @@ struct State {
     progress_seq: u64,
     progress_token: NumberOrString,
     last_reindex_ms: u128,
+    warned_resolver: HashSet<PathBuf>,
 }
 
 impl State {
@@ -246,6 +248,7 @@ impl State {
             progress_seq: 0,
             progress_token: NumberOrString::String(String::new()),
             last_reindex_ms: 0,
+            warned_resolver: HashSet::new(),
         }
     }
 
@@ -463,6 +466,13 @@ fn watched_globs() -> Vec<String> {
     globs
 }
 
+/// True when the path names a resolver configuration file.
+fn is_resolver_config(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| RESOLVER_CONFIGS.contains(&name))
+}
+
 fn register_watched_files(connection: &Connection) -> anyhow::Result<()> {
     let params = watched_files_registration()?;
     let request = WireRequest {
@@ -638,7 +648,11 @@ fn send_response_error(connection: &Connection, id: RequestId, error: ServerErro
     }
 }
 
-fn handle_notification(state: &mut State, notification: WireNotification) -> Option<String> {
+fn handle_notification(
+    connection: &Connection,
+    state: &mut State,
+    notification: WireNotification,
+) -> Option<String> {
     let WireNotification { method, params } = notification;
     if method == notification::DidOpenTextDocument::METHOD {
         let Ok(params) = serde_json::from_value::<DidOpenTextDocumentParams>(params) else {
@@ -715,18 +729,56 @@ fn handle_notification(state: &mut State, notification: WireNotification) -> Opt
             tracing::warn!("bad didChangeWatchedFiles params");
             return None;
         };
-        let relevant = params.changes.iter().any(|event| {
-            convert::uri_to_path(event.uri.as_str())
-                .filter(|path| path.starts_with(&state.root))
-                .and_then(|path| meta_ast::detect_language(&path))
-                .is_some()
-        });
-        if relevant {
-            state.schedule(true);
-        }
+        handle_watched_files(connection, state, &params);
         None
     } else {
         None
+    }
+}
+
+/// Reindex on source changes. Warn once per resolver config change.
+fn handle_watched_files(
+    connection: &Connection,
+    state: &mut State,
+    params: &DidChangeWatchedFilesParams,
+) {
+    let mut source_changed = false;
+    for event in &params.changes {
+        let Some(path) = convert::uri_to_path(event.uri.as_str()) else {
+            continue;
+        };
+        if !path.starts_with(&state.root) {
+            continue;
+        }
+        if meta_ast::detect_language(&path).is_some() {
+            source_changed = true;
+        } else if is_resolver_config(&path) && state.warned_resolver.insert(path.clone()) {
+            warn_resolver_change(connection, &path);
+        }
+    }
+    if source_changed {
+        state.schedule(true);
+    }
+}
+
+/// Tell the user that resolver state needs a restart. The engine caches
+/// resolver filesystem state for the process lifetime.
+fn warn_resolver_change(connection: &Connection, path: &Path) {
+    let params = ShowMessageParams {
+        typ: MessageType::WARNING,
+        message: format!(
+            "{} changed. Restart the server to apply the new resolver configuration.",
+            path.display()
+        ),
+    };
+    if let Err(error) = connection
+        .sender
+        .send(Message::Notification(WireNotification::new(
+            "window/showMessage".to_string(),
+            params,
+        )))
+    {
+        tracing::warn!(%error, "resolver warning failed");
     }
 }
 
@@ -840,7 +892,12 @@ mod tests {
     #[test]
     fn did_open_unknown_language_skips_reindex() {
         let (mut state, rx, _dir) = state();
-        handle_notification(&mut state, did_open("file:///notes.txt", "plaintext"));
+        let (server, _client) = Connection::memory();
+        handle_notification(
+            &server,
+            &mut state,
+            did_open("file:///notes.txt", "plaintext"),
+        );
         assert!(state.buffers.get("file:///notes.txt").is_none());
         assert!(rx.try_recv().is_err(), "no reindex expected");
     }
@@ -848,7 +905,8 @@ mod tests {
     #[test]
     fn did_open_supported_language_requests_reindex() {
         let (mut state, rx, _dir) = state();
-        handle_notification(&mut state, did_open("file:///a.py", "python"));
+        let (server, _client) = Connection::memory();
+        handle_notification(&server, &mut state, did_open("file:///a.py", "python"));
         assert!(state.buffers.get("file:///a.py").is_some());
         assert!(rx.try_recv().is_ok(), "reindex expected");
     }
@@ -870,13 +928,6 @@ mod tests {
     }
 
     #[test]
-    fn watched_globs_cover_resolver_configs() {
-        let globs = watched_globs();
-        assert!(globs.iter().any(|glob| glob == "**/tsconfig.json"));
-        assert!(globs.iter().any(|glob| glob == "**/go.mod"));
-    }
-
-    #[test]
     fn watched_files_registration_is_well_formed() {
         let params = watched_files_registration().unwrap();
         let value = serde_json::to_value(&params).unwrap();
@@ -891,24 +942,65 @@ mod tests {
     #[test]
     fn watched_source_change_requests_reindex() {
         let (mut state, rx, dir) = state();
+        let (server, _client) = Connection::memory();
         let uri = convert::path_to_uri(&dir.path().join("a.py")).unwrap();
-        handle_notification(&mut state, watched(uri.as_str()));
+        handle_notification(&server, &mut state, watched(uri.as_str()));
         assert!(rx.try_recv().is_ok(), "reindex expected");
     }
 
     #[test]
     fn watched_change_outside_root_is_ignored() {
         let (mut state, rx, _dir) = state();
-        handle_notification(&mut state, watched("file:///elsewhere/a.py"));
+        let (server, _client) = Connection::memory();
+        handle_notification(&server, &mut state, watched("file:///elsewhere/a.py"));
         assert!(rx.try_recv().is_err(), "no reindex expected");
     }
 
     #[test]
     fn watched_change_for_unsupported_extension_is_ignored() {
         let (mut state, rx, dir) = state();
+        let (server, _client) = Connection::memory();
         let uri = convert::path_to_uri(&dir.path().join("README.md")).unwrap();
-        handle_notification(&mut state, watched(uri.as_str()));
+        handle_notification(&server, &mut state, watched(uri.as_str()));
         assert!(rx.try_recv().is_err(), "no reindex expected");
+    }
+
+    #[test]
+    fn watched_resolver_change_warns_once() {
+        let (mut state, rx, dir) = state();
+        let (server, client) = Connection::memory();
+        let uri = convert::path_to_uri(&dir.path().join("tsconfig.json")).unwrap();
+
+        handle_notification(&server, &mut state, watched(uri.as_str()));
+        assert!(rx.try_recv().is_err(), "resolver change must not reindex");
+
+        let message = client
+            .receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("resolver warning");
+        let Message::Notification(notification) = message else {
+            panic!("expected a warning notification");
+        };
+        assert_eq!(notification.method, "window/showMessage");
+        let params: ShowMessageParams = serde_json::from_value(notification.params).unwrap();
+        assert_eq!(params.typ, MessageType::WARNING);
+        assert!(params.message.contains("tsconfig.json"));
+
+        handle_notification(&server, &mut state, watched(uri.as_str()));
+        assert!(
+            client
+                .receiver
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "second change must not warn again"
+        );
+    }
+
+    #[test]
+    fn watched_globs_cover_resolver_configs() {
+        let globs = watched_globs();
+        assert!(globs.iter().any(|glob| glob == "**/tsconfig.json"));
+        assert!(globs.iter().any(|glob| glob == "**/go.mod"));
     }
 
     #[test]
