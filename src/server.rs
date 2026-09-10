@@ -1,11 +1,12 @@
 //! Sync LSP loop.
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use crossbeam_channel::{Receiver, Sender, select};
+use crossbeam_channel::{Receiver, Sender, TrySendError, select};
 use lsp_server::{Connection, Message};
 use lsp_server::{Notification as WireNotification, Request as WireRequest, RequestId, Response};
 use lsp_types::notification::Notification as LspNotification;
@@ -17,12 +18,12 @@ use lsp_types::{
     DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
     DocumentSymbolParams, DocumentSymbolResponse, FileSystemWatcher, GlobPattern,
     GotoDefinitionParams, GotoDefinitionResponse, HoverParams, HoverProviderCapability,
-    InitializeParams, OneOf, ProgressParams, ProgressParamsValue, PublishDiagnosticsParams,
-    ReferenceParams, Registration, RegistrationParams, SaveOptions, ServerCapabilities,
-    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
-    TextDocumentSyncSaveOptions, Uri, WorkDoneProgress, WorkDoneProgressBegin,
-    WorkDoneProgressCreateParams, WorkDoneProgressEnd, WorkspaceSymbolParams,
-    WorkspaceSymbolResponse,
+    InitializeParams, MessageType, OneOf, ProgressParams, ProgressParamsValue,
+    PublishDiagnosticsParams, ReferenceParams, Registration, RegistrationParams, SaveOptions,
+    ServerCapabilities, ShowMessageParams, TextDocumentSyncCapability, TextDocumentSyncKind,
+    TextDocumentSyncOptions, TextDocumentSyncSaveOptions, Uri, WorkDoneProgress,
+    WorkDoneProgressBegin, WorkDoneProgressCreateParams, WorkDoneProgressEnd,
+    WorkspaceSymbolParams, WorkspaceSymbolResponse,
 };
 use lsp_types::{notification, request};
 
@@ -37,10 +38,21 @@ use crate::reindex::{self, ReindexReq, ReindexResp};
 
 const SERVER_NAME: &str = "meta-ast-lsp";
 const PROGRESS_THRESHOLD_MS: u128 = 500;
+const IDLE_TIMEOUT: Duration = Duration::from_secs(3600);
+
+/// Files whose contents shape engine resolver state for the process lifetime.
+const RESOLVER_CONFIGS: [&str; 5] = [
+    "tsconfig.json",
+    "jsconfig.json",
+    "go.mod",
+    "pyproject.toml",
+    "package.json",
+];
 
 pub fn run() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
         .init();
     meta_ast::language::validate_queries();
     let (connection, io_threads) = Connection::stdio();
@@ -85,98 +97,49 @@ pub fn run_connection(connection: Connection) -> anyhow::Result<()> {
             "client has no dynamic watched-file registration; external changes stay untracked"
         );
     }
-    let (req_tx, req_rx) = crossbeam_channel::unbounded();
+    let (req_tx, req_rx) = crossbeam_channel::bounded(1);
     let (resp_tx, resp_rx) = crossbeam_channel::unbounded();
-    let mut reindexer = index::Reindexer::new();
+    let mut reindexer = index::Reindexer::with_persistence();
+    let warmed = reindexer.seed_from_shards(&root);
+    if warmed.loaded > 0 || warmed.skipped > 0 {
+        tracing::info!(
+            loaded = warmed.loaded,
+            skipped = warmed.skipped,
+            "cold start from .meta-ast"
+        );
+    }
     let first = Arc::new(reindexer.rebuild(&root, &[], 1)?);
     let worker = reindex::spawn_worker(req_rx, resp_tx, reindexer);
     let mut state = State::new(root, req_tx, encoding, first, progress_supported);
     let mut shutdown = false;
     'serve: loop {
-        if let Some(remaining) = state.pending_remaining() {
-            select! {
-                recv(connection.receiver) -> msg => {
-                    let Ok(msg) = msg else { break 'serve };
-                    match msg {
-                        Message::Request(request) => {
-                            if connection
-                                .handle_shutdown(&request)
-                                .context("answer shutdown")?
-                            {
-                                shutdown = true;
-                                break 'serve;
-                            }
-                            handle_request(&connection, &mut state, request);
-                        }
-                        Message::Notification(notification) => {
-                            if notification.method == "exit" {
-                                break 'serve;
-                            }
-                            if let Some(uri) = handle_notification(&mut state, notification)
-                                && let Err(error) = publish_clear(&connection, uri.as_str())
-                            {
-                                tracing::warn!(%error, "clear failed");
-                            }
-                            state.pump_progress(&connection);
-                        }
-                        Message::Response(_) => {}
+        let timeout = state.pending_remaining().unwrap_or(IDLE_TIMEOUT);
+        select! {
+            recv(connection.receiver) -> msg => {
+                let Ok(msg) = msg else { break 'serve };
+                match handle_client_message(&connection, &mut state, msg)? {
+                    LoopControl::Continue => {}
+                    LoopControl::Shutdown => {
+                        shutdown = true;
+                        break 'serve;
                     }
-                }
-                recv(resp_rx) -> resp => {
-                    let Ok(resp) = resp else {
-                        worker_gone(&connection, &mut state, true);
-                        continue 'serve;
-                    };
-                    apply_resp(&connection, &mut state, resp);
-                }
-                default(remaining) => {
-                    state.flush();
-                    state.pump_progress(&connection);
-                    drain_resps(&connection, &mut state, &resp_rx);
+                    LoopControl::Exit => break 'serve,
                 }
             }
-        } else {
-            select! {
-                recv(connection.receiver) -> msg => {
-                    let Ok(msg) = msg else { break 'serve };
-                    match msg {
-                        Message::Request(request) => {
-                            if connection
-                                .handle_shutdown(&request)
-                                .context("answer shutdown")?
-                            {
-                                shutdown = true;
-                                break 'serve;
-                            }
-                            handle_request(&connection, &mut state, request);
-                        }
-                        Message::Notification(notification) => {
-                            if notification.method == "exit" {
-                                break 'serve;
-                            }
-                            if let Some(uri) = handle_notification(&mut state, notification)
-                                && let Err(error) = publish_clear(&connection, uri.as_str())
-                            {
-                                tracing::warn!(%error, "clear failed");
-                            }
-                            state.pump_progress(&connection);
-                        }
-                        Message::Response(_) => {}
-                    }
-                }
-                recv(resp_rx) -> resp => {
-                    let Ok(resp) = resp else {
-                        worker_gone(&connection, &mut state, false);
-                        continue 'serve;
-                    };
-                    apply_resp(&connection, &mut state, resp);
-                }
+            recv(resp_rx) -> resp => {
+                let Ok(resp) = resp else {
+                    worker_gone(&connection, &mut state);
+                    continue 'serve;
+                };
+                apply_resp(&connection, &mut state, resp);
             }
+            default(timeout) => {}
         }
         drain_resps(&connection, &mut state, &resp_rx);
         if state.flush_due() {
             state.flush();
         }
+        state.flush_queued();
         state.pump_progress(&connection);
     }
     drop(state.req_tx);
@@ -185,6 +148,45 @@ pub fn run_connection(connection: Connection) -> anyhow::Result<()> {
         tracing::warn!("client exited without shutdown");
     }
     Ok(())
+}
+
+/// Control flow returned by a handled client message.
+enum LoopControl {
+    Continue,
+    Shutdown,
+    Exit,
+}
+
+fn handle_client_message(
+    connection: &Connection,
+    state: &mut State,
+    message: Message,
+) -> anyhow::Result<LoopControl> {
+    match message {
+        Message::Request(request) => {
+            if connection
+                .handle_shutdown(&request)
+                .context("answer shutdown")?
+            {
+                return Ok(LoopControl::Shutdown);
+            }
+            handle_request(connection, state, request);
+            Ok(LoopControl::Continue)
+        }
+        Message::Notification(notification) => {
+            if notification.method == "exit" {
+                return Ok(LoopControl::Exit);
+            }
+            if let Some(uri) = handle_notification(connection, state, notification)
+                && let Err(error) = publish_clear(connection, uri.as_str())
+            {
+                tracing::warn!(%error, "clear failed");
+            }
+            state.pump_progress(connection);
+            Ok(LoopControl::Continue)
+        }
+        Message::Response(_) => Ok(LoopControl::Continue),
+    }
 }
 
 struct Pending {
@@ -205,11 +207,13 @@ struct State {
     encoding: Encoding,
     cancel: Cancellation,
     progress_supported: bool,
-    progress_active: bool,
-    progress_pending: bool,
+    progress_active: Option<u64>,
+    progress_pending: Option<u64>,
     progress_seq: u64,
     progress_token: NumberOrString,
     last_reindex_ms: u128,
+    warned_resolver: HashSet<PathBuf>,
+    queued: Option<ReindexReq>,
 }
 
 impl State {
@@ -232,11 +236,13 @@ impl State {
             encoding,
             cancel: Cancellation::default(),
             progress_supported,
-            progress_active: false,
-            progress_pending: false,
+            progress_active: None,
+            progress_pending: None,
             progress_seq: 0,
             progress_token: NumberOrString::String(String::new()),
             last_reindex_ms: 0,
+            warned_resolver: HashSet::new(),
+            queued: None,
         }
     }
 
@@ -257,22 +263,41 @@ impl State {
             root: self.root.clone(),
             overlays,
         };
-        if self.req_tx.send(req).is_err() {
-            tracing::warn!("reindex worker gone, keeping prior snapshot");
+        self.queue(req);
+        self.progress_pending = (self.progress_supported
+            && self.last_reindex_ms > PROGRESS_THRESHOLD_MS)
+            .then_some(seq);
+    }
+
+    /// Send when the worker has room. Keep only the newest request otherwise.
+    fn queue(&mut self, req: ReindexReq) {
+        match self.req_tx.try_send(req) {
+            Ok(()) => {}
+            Err(TrySendError::Full(req)) => self.queued = Some(req),
+            Err(TrySendError::Disconnected(_)) => {
+                tracing::warn!("reindex worker gone, keeping prior snapshot");
+            }
         }
-        self.progress_pending =
-            self.progress_supported && self.last_reindex_ms > PROGRESS_THRESHOLD_MS;
+    }
+
+    /// Push the latest held request when the channel drains.
+    fn flush_queued(&mut self) {
+        if let Some(req) = self.queued.take() {
+            self.queue(req);
+        }
     }
 
     /// Start a progress operation when the previous reindex was slow.
     fn pump_progress(&mut self, connection: &Connection) {
-        if self.progress_pending && !self.progress_active {
-            self.progress_pending = false;
-            self.start_progress(connection);
+        if let Some(seq) = self.progress_pending
+            && self.progress_active.is_none()
+        {
+            self.progress_pending = None;
+            self.start_progress(connection, seq);
         }
     }
 
-    fn start_progress(&mut self, connection: &Connection) {
+    fn start_progress(&mut self, connection: &Connection, seq: u64) {
         self.progress_seq += 1;
         let token = NumberOrString::String(format!("meta-ast-reindex-{}", self.progress_seq));
         let create = WireRequest {
@@ -299,12 +324,12 @@ impl State {
                 "$/progress".to_string(),
                 begin,
             )));
-        self.progress_active = true;
+        self.progress_active = Some(seq);
         self.progress_token = token;
     }
 
     fn end_progress(&mut self, connection: &Connection) {
-        if !self.progress_active {
+        if self.progress_active.take().is_none() {
             return;
         }
         let end = ProgressParams {
@@ -319,7 +344,6 @@ impl State {
                 "$/progress".to_string(),
                 end,
             )));
-        self.progress_active = false;
     }
 
     fn schedule(&mut self, immediate: bool) {
@@ -364,11 +388,10 @@ impl SourceText for State {
     }
 }
 
-fn worker_gone(connection: &Connection, state: &mut State, clear_pending: bool) {
+fn worker_gone(connection: &Connection, state: &mut State) {
     tracing::warn!("reindex worker gone");
-    if clear_pending {
-        state.pending = None;
-    }
+    state.pending = None;
+    state.queued = None;
     state.end_progress(connection);
 }
 
@@ -380,7 +403,6 @@ fn drain_resps(connection: &Connection, state: &mut State, resp_rx: &Receiver<Re
 
 fn apply_resp(connection: &Connection, state: &mut State, resp: ReindexResp) {
     if resp.seq <= state.applied_seq {
-        state.end_progress(connection);
         return;
     }
     state.applied_seq = resp.seq;
@@ -399,7 +421,9 @@ fn apply_resp(connection: &Connection, state: &mut State, resp: ReindexResp) {
         }
         Err(error) => tracing::warn!(%error, "reindex failed, keeping prior snapshot"),
     }
-    state.end_progress(connection);
+    if state.progress_active == Some(resp.seq) {
+        state.end_progress(connection);
+    }
 }
 
 fn capabilities(encoding: Encoding) -> ServerCapabilities {
@@ -437,7 +461,8 @@ fn supports_watched_files(caps: &lsp_types::ClientCapabilities) -> bool {
         .unwrap_or(false)
 }
 
-/// Glob patterns for every extension meta-ast can parse.
+/// Glob patterns for every extension meta-ast can parse, plus resolver
+/// configuration files.
 fn watched_globs() -> Vec<String> {
     let mut globs = Vec::new();
     for lang in meta_ast::LangId::all() {
@@ -445,9 +470,19 @@ fn watched_globs() -> Vec<String> {
             globs.push(format!("**/*.{extension}"));
         }
     }
+    for name in RESOLVER_CONFIGS {
+        globs.push(format!("**/{name}"));
+    }
     globs.sort();
     globs.dedup();
     globs
+}
+
+/// True when the path names a resolver configuration file.
+fn is_resolver_config(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| RESOLVER_CONFIGS.contains(&name))
 }
 
 fn register_watched_files(connection: &Connection) -> anyhow::Result<()> {
@@ -625,7 +660,11 @@ fn send_response_error(connection: &Connection, id: RequestId, error: ServerErro
     }
 }
 
-fn handle_notification(state: &mut State, notification: WireNotification) -> Option<String> {
+fn handle_notification(
+    connection: &Connection,
+    state: &mut State,
+    notification: WireNotification,
+) -> Option<String> {
     let WireNotification { method, params } = notification;
     if method == notification::DidOpenTextDocument::METHOD {
         let Ok(params) = serde_json::from_value::<DidOpenTextDocumentParams>(params) else {
@@ -668,8 +707,10 @@ fn handle_notification(state: &mut State, notification: WireNotification) -> Opt
         let uri = params.text_document.uri.as_str().to_string();
         if state.buffers.close(uri.as_str()) {
             state.schedule(true);
+            Some(uri)
+        } else {
+            None
         }
-        Some(uri)
     } else if method == notification::DidSaveTextDocument::METHOD {
         let Ok(params) = serde_json::from_value::<DidSaveTextDocumentParams>(params) else {
             tracing::warn!("bad didSave params");
@@ -702,18 +743,56 @@ fn handle_notification(state: &mut State, notification: WireNotification) -> Opt
             tracing::warn!("bad didChangeWatchedFiles params");
             return None;
         };
-        let relevant = params.changes.iter().any(|event| {
-            convert::uri_to_path(event.uri.as_str())
-                .filter(|path| path.starts_with(&state.root))
-                .and_then(|path| meta_ast::detect_language(&path))
-                .is_some()
-        });
-        if relevant {
-            state.schedule(true);
-        }
+        handle_watched_files(connection, state, &params);
         None
     } else {
         None
+    }
+}
+
+/// Reindex on source changes. Warn once per resolver config change.
+fn handle_watched_files(
+    connection: &Connection,
+    state: &mut State,
+    params: &DidChangeWatchedFilesParams,
+) {
+    let mut source_changed = false;
+    for event in &params.changes {
+        let Some(path) = convert::uri_to_path(event.uri.as_str()) else {
+            continue;
+        };
+        if !path.starts_with(&state.root) {
+            continue;
+        }
+        if meta_ast::detect_language(&path).is_some() {
+            source_changed = true;
+        } else if is_resolver_config(&path) && state.warned_resolver.insert(path.clone()) {
+            warn_resolver_change(connection, &path);
+        }
+    }
+    if source_changed {
+        state.schedule(true);
+    }
+}
+
+/// Tell the user that resolver state needs a restart. The engine caches
+/// resolver filesystem state for the process lifetime.
+fn warn_resolver_change(connection: &Connection, path: &Path) {
+    let params = ShowMessageParams {
+        typ: MessageType::WARNING,
+        message: format!(
+            "{} changed. Restart the server to apply the new resolver configuration.",
+            path.display()
+        ),
+    };
+    if let Err(error) = connection
+        .sender
+        .send(Message::Notification(WireNotification::new(
+            "window/showMessage".to_string(),
+            params,
+        )))
+    {
+        tracing::warn!(%error, "resolver warning failed");
     }
 }
 
@@ -812,6 +891,15 @@ mod tests {
         }
     }
 
+    fn did_close(uri: &str) -> WireNotification {
+        WireNotification {
+            method: notification::DidCloseTextDocument::METHOD.to_string(),
+            params: serde_json::json!({
+                "textDocument": { "uri": uri }
+            }),
+        }
+    }
+
     #[test]
     fn cold_start_builds_index() {
         let (state, _rx, _dir) = state();
@@ -827,7 +915,12 @@ mod tests {
     #[test]
     fn did_open_unknown_language_skips_reindex() {
         let (mut state, rx, _dir) = state();
-        handle_notification(&mut state, did_open("file:///notes.txt", "plaintext"));
+        let (server, _client) = Connection::memory();
+        handle_notification(
+            &server,
+            &mut state,
+            did_open("file:///notes.txt", "plaintext"),
+        );
         assert!(state.buffers.get("file:///notes.txt").is_none());
         assert!(rx.try_recv().is_err(), "no reindex expected");
     }
@@ -835,9 +928,26 @@ mod tests {
     #[test]
     fn did_open_supported_language_requests_reindex() {
         let (mut state, rx, _dir) = state();
-        handle_notification(&mut state, did_open("file:///a.py", "python"));
+        let (server, _client) = Connection::memory();
+        handle_notification(&server, &mut state, did_open("file:///a.py", "python"));
         assert!(state.buffers.get("file:///a.py").is_some());
         assert!(rx.try_recv().is_ok(), "reindex expected");
+    }
+
+    #[test]
+    fn did_close_reports_only_tracked_documents() {
+        let (mut state, _rx, _dir) = state();
+        let (server, _client) = Connection::memory();
+
+        handle_notification(&server, &mut state, did_open("file:///a.py", "python"));
+        assert_eq!(
+            handle_notification(&server, &mut state, did_close("file:///a.py")),
+            Some("file:///a.py".to_string())
+        );
+        assert_eq!(
+            handle_notification(&server, &mut state, did_close("file:///notes.txt")),
+            None
+        );
     }
 
     fn watched(uri: &str) -> WireNotification {
@@ -871,24 +981,65 @@ mod tests {
     #[test]
     fn watched_source_change_requests_reindex() {
         let (mut state, rx, dir) = state();
+        let (server, _client) = Connection::memory();
         let uri = convert::path_to_uri(&dir.path().join("a.py")).unwrap();
-        handle_notification(&mut state, watched(uri.as_str()));
+        handle_notification(&server, &mut state, watched(uri.as_str()));
         assert!(rx.try_recv().is_ok(), "reindex expected");
     }
 
     #[test]
     fn watched_change_outside_root_is_ignored() {
         let (mut state, rx, _dir) = state();
-        handle_notification(&mut state, watched("file:///elsewhere/a.py"));
+        let (server, _client) = Connection::memory();
+        handle_notification(&server, &mut state, watched("file:///elsewhere/a.py"));
         assert!(rx.try_recv().is_err(), "no reindex expected");
     }
 
     #[test]
     fn watched_change_for_unsupported_extension_is_ignored() {
         let (mut state, rx, dir) = state();
+        let (server, _client) = Connection::memory();
         let uri = convert::path_to_uri(&dir.path().join("README.md")).unwrap();
-        handle_notification(&mut state, watched(uri.as_str()));
+        handle_notification(&server, &mut state, watched(uri.as_str()));
         assert!(rx.try_recv().is_err(), "no reindex expected");
+    }
+
+    #[test]
+    fn watched_resolver_change_warns_once() {
+        let (mut state, rx, dir) = state();
+        let (server, client) = Connection::memory();
+        let uri = convert::path_to_uri(&dir.path().join("tsconfig.json")).unwrap();
+
+        handle_notification(&server, &mut state, watched(uri.as_str()));
+        assert!(rx.try_recv().is_err(), "resolver change must not reindex");
+
+        let message = client
+            .receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("resolver warning");
+        let Message::Notification(notification) = message else {
+            panic!("expected a warning notification");
+        };
+        assert_eq!(notification.method, "window/showMessage");
+        let params: ShowMessageParams = serde_json::from_value(notification.params).unwrap();
+        assert_eq!(params.typ, MessageType::WARNING);
+        assert!(params.message.contains("tsconfig.json"));
+
+        handle_notification(&server, &mut state, watched(uri.as_str()));
+        assert!(
+            client
+                .receiver
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "second change must not warn again"
+        );
+    }
+
+    #[test]
+    fn watched_globs_cover_resolver_configs() {
+        let globs = watched_globs();
+        assert!(globs.iter().any(|glob| glob == "**/tsconfig.json"));
+        assert!(globs.iter().any(|glob| glob == "**/go.mod"));
     }
 
     #[test]
@@ -925,10 +1076,10 @@ mod tests {
     }
 
     #[test]
-    fn stale_reindex_response_ends_progress() {
+    fn stale_reindex_response_keeps_newest_progress() {
         let (server, client) = Connection::memory();
         let (mut state, _rx, _dir) = state();
-        state.progress_active = true;
+        state.progress_active = Some(5);
         state.progress_seq = 3;
         state.progress_token = NumberOrString::String("meta-ast-reindex-3".to_string());
         state.applied_seq = 5;
@@ -943,7 +1094,35 @@ mod tests {
             },
         );
 
-        assert!(!state.progress_active);
+        assert_eq!(state.progress_active, Some(5));
+        assert!(
+            client
+                .receiver
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "stale response must not end the newest progress"
+        );
+    }
+
+    #[test]
+    fn matching_reindex_response_ends_progress() {
+        let (server, client) = Connection::memory();
+        let (mut state, _rx, _dir) = state();
+        state.progress_active = Some(2);
+        state.progress_seq = 1;
+        state.progress_token = NumberOrString::String("meta-ast-reindex-1".to_string());
+
+        apply_resp(
+            &server,
+            &mut state,
+            ReindexResp {
+                seq: 2,
+                elapsed_ms: 1,
+                result: Err(anyhow::anyhow!("reindex failed")),
+            },
+        );
+
+        assert!(state.progress_active.is_none());
         let message = client
             .receiver
             .recv_timeout(std::time::Duration::from_secs(5))
@@ -955,24 +1134,21 @@ mod tests {
         let params: ProgressParams = serde_json::from_value(notification.params).unwrap();
         assert_eq!(
             params.token,
-            NumberOrString::String("meta-ast-reindex-3".to_string())
+            NumberOrString::String("meta-ast-reindex-1".to_string())
         );
-        let ProgressParamsValue::WorkDone(WorkDoneProgress::End(_)) = params.value else {
-            panic!("expected a progress end");
-        };
     }
 
     #[test]
     fn worker_disconnect_ends_progress() {
         let (server, client) = Connection::memory();
         let (mut state, _rx, _dir) = state();
-        state.progress_active = true;
+        state.progress_active = Some(4);
         state.progress_seq = 4;
         state.progress_token = NumberOrString::String("meta-ast-reindex-4".to_string());
 
-        worker_gone(&server, &mut state, true);
+        worker_gone(&server, &mut state);
 
-        assert!(!state.progress_active);
+        assert!(state.progress_active.is_none());
         let message = client
             .receiver
             .recv_timeout(std::time::Duration::from_secs(5))
@@ -981,5 +1157,32 @@ mod tests {
             panic!("expected a progress notification");
         };
         assert_eq!(notification.method, "$/progress");
+    }
+
+    #[test]
+    fn full_request_queue_keeps_latest() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.py"), "def greet(): pass\n").unwrap();
+        let (req_tx, req_rx) = crossbeam_channel::bounded(1);
+        let snapshot = Arc::new(index::rebuild_from_inputs(dir.path(), &[], 1).unwrap());
+        let mut state = State::new(
+            dir.path().to_path_buf(),
+            req_tx,
+            Encoding::Utf16,
+            snapshot,
+            false,
+        );
+
+        state.schedule(true);
+        state.schedule(true);
+
+        let first = req_rx.try_recv().expect("first request");
+        assert_eq!(first.seq, 1);
+        assert!(state.queued.is_some(), "newest request waits for room");
+
+        state.flush_queued();
+        let second = req_rx.try_recv().expect("queued request");
+        assert_eq!(second.seq, 2);
+        assert!(state.queued.is_none());
     }
 }

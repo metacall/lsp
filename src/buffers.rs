@@ -114,8 +114,12 @@ fn lang_from_id(id: &str) -> Option<meta_ast::LangId> {
 }
 
 fn apply_patch(text: &mut String, range: Range, replacement: &str, encoding: Encoding) {
-    let start = position::to_byte_offset(text, range.start, encoding).unwrap_or(text.len());
-    let end = position::to_byte_offset(text, range.end, encoding)
+    let index = position::LineIndex::new(text);
+    let start = index
+        .to_byte_offset(text, range.start, encoding)
+        .unwrap_or(text.len());
+    let end = index
+        .to_byte_offset(text, range.end, encoding)
         .unwrap_or(text.len())
         .max(start);
     text.replace_range(start..end, replacement);

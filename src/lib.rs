@@ -8,3 +8,4 @@ pub mod index;
 pub mod position;
 pub mod reindex;
 pub mod server;
+pub mod shards;

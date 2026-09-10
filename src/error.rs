@@ -2,7 +2,6 @@
 use lsp_server::{RequestId, Response, ResponseError};
 
 const INVALID_PARAMS: i32 = -32602;
-const INTERNAL_ERROR: i32 = -32603;
 const REQUEST_CANCELLED: i32 = -32800;
 
 #[derive(Debug, thiserror::Error)]
@@ -11,10 +10,6 @@ pub enum ServerError {
     Protocol(String),
     #[error("request cancelled")]
     Cancelled,
-    #[error(transparent)]
-    Engine(#[from] meta_ast::Error),
-    #[error(transparent)]
-    Io(#[from] std::io::Error),
 }
 
 impl ServerError {
@@ -22,7 +17,6 @@ impl ServerError {
         let code = match self {
             ServerError::Protocol(_) => INVALID_PARAMS,
             ServerError::Cancelled => REQUEST_CANCELLED,
-            ServerError::Engine(_) | ServerError::Io(_) => INTERNAL_ERROR,
         };
         Response {
             id,
@@ -49,5 +43,17 @@ mod tests {
         };
         assert_eq!(error.code, -32800);
         assert_eq!(error.message, "request cancelled");
+    }
+
+    #[test]
+    fn protocol_uses_invalid_params_code() {
+        let id = RequestId::from(8);
+        let response = ServerError::Protocol("bad params".to_string()).to_response(id.clone());
+        assert_eq!(response.id, id);
+        let Err(error) = response.response_result else {
+            panic!("protocol error must be a response error");
+        };
+        assert_eq!(error.code, -32602);
+        assert_eq!(error.message, "protocol: bad params");
     }
 }

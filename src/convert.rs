@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use lsp_types::{CompletionItemKind, DiagnosticSeverity, Range, SymbolKind, Uri};
 
-use crate::position::{self, Encoding};
+use crate::position::{self, Encoding, SourceFile};
 
 pub fn uri_to_path(uri: &str) -> Option<PathBuf> {
     let parsed = url::Url::parse(uri).ok()?;
@@ -64,7 +64,7 @@ fn severity(severity: meta_ast::Severity) -> DiagnosticSeverity {
 }
 
 pub fn diagnostic_to_lsp(
-    text: Option<&str>,
+    source: Option<&SourceFile>,
     diagnostic: &meta_ast::Diagnostic,
     encoding: Encoding,
 ) -> lsp_types::Diagnostic {
@@ -72,7 +72,10 @@ pub fn diagnostic_to_lsp(
         range: diagnostic
             .source_range
             .as_ref()
-            .map(|range| position::range(text, range, encoding))
+            .map(|range| match source {
+                Some(source) => source.range(range, encoding),
+                None => position::range_without_text(range),
+            })
             .unwrap_or(Range {
                 start: lsp_types::Position {
                     line: 0,
@@ -116,7 +119,7 @@ mod tests {
             }),
         };
 
-        let utf8 = diagnostic_to_lsp(Some(TEXT), &diagnostic, Encoding::Utf8);
+        let utf8 = diagnostic_to_lsp(Some(&SourceFile::new(TEXT)), &diagnostic, Encoding::Utf8);
         assert_eq!(
             utf8.range,
             Range {
@@ -131,7 +134,7 @@ mod tests {
             }
         );
 
-        let utf16 = diagnostic_to_lsp(Some(TEXT), &diagnostic, Encoding::Utf16);
+        let utf16 = diagnostic_to_lsp(Some(&SourceFile::new(TEXT)), &diagnostic, Encoding::Utf16);
         assert_eq!(
             utf16.range,
             Range {
