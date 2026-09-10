@@ -6,38 +6,36 @@ use lsp_types::{
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::Arc,
 };
 
 use crate::convert;
 use crate::index::{self, IndexSnapshot, SourceText};
-use crate::position::{self, Encoding};
+use crate::position::{self, Encoding, SourceFile};
 
-/// Source text memoized once for each distinct request path.
+/// Source text plus line index, memoized once for each distinct request path.
 struct TextCache<'a> {
     lookup: &'a dyn SourceText,
-    texts: HashMap<PathBuf, Option<Arc<str>>>,
+    files: HashMap<PathBuf, Option<SourceFile>>,
 }
 
 impl<'a> TextCache<'a> {
     fn new(lookup: &'a dyn SourceText) -> Self {
         Self {
             lookup,
-            texts: HashMap::new(),
+            files: HashMap::new(),
         }
     }
 
-    fn text(&mut self, path: &Path) -> Option<&str> {
+    fn file(&mut self, path: &Path) -> Option<&SourceFile> {
         let lookup = self.lookup;
-        let cached = self
-            .texts
+        self.files
             .entry(path.to_path_buf())
             .or_insert_with_key(|key| {
                 lookup
                     .source(key)
-                    .map(|text| Arc::<str>::from(text.into_owned()))
-            });
-        cached.as_deref()
+                    .map(|text| SourceFile::new(text.into_owned()))
+            })
+            .as_ref()
     }
 }
 
@@ -47,9 +45,9 @@ fn location_for_symbol(
     encoding: Encoding,
 ) -> Option<Location> {
     let uri = convert::path_to_uri(&symbol.file_path)?;
-    let range = {
-        let text = cache.text(&symbol.file_path);
-        position::range(text, &symbol.source_range, encoding)
+    let range = match cache.file(&symbol.file_path) {
+        Some(source) => source.range(&symbol.source_range, encoding),
+        None => position::range_without_text(&symbol.source_range),
     };
     Some(Location { uri, range })
 }
@@ -68,7 +66,7 @@ pub fn document_symbols(
     let Some(file_uri) = convert::path_to_uri(&file.path) else {
         return Vec::new();
     };
-    let range_text = cache.text(&file.path).map(str::to_owned);
+    let source = cache.file(&file.path);
     file.symbols
         .iter()
         .map(|symbol| SymbolInformation {
@@ -78,7 +76,10 @@ pub fn document_symbols(
             deprecated: None,
             location: Location {
                 uri: file_uri.clone(),
-                range: position::range(range_text.as_deref(), &symbol.source_range, encoding),
+                range: match source {
+                    Some(source) => source.range(&symbol.source_range, encoding),
+                    None => position::range_without_text(&symbol.source_range),
+                },
             },
             container_name: None,
         })
@@ -95,8 +96,8 @@ pub fn hover_at(
     let mut cache = TextCache::new(sources);
     let file = index::file_for_uri(snapshot, uri)?;
     let byte = {
-        let text = cache.text(&file.path)?;
-        position::to_byte_offset(text, pos, encoding)?
+        let source = cache.file(&file.path)?;
+        source.to_byte_offset(pos, encoding)?
     };
     let symbol = index::symbol_at(snapshot, uri, byte)?;
     let mut value = format!(
@@ -110,16 +111,16 @@ pub fn hover_at(
         value.push_str("\n\n");
         value.push_str(docstring);
     }
+    let range = match cache.file(&file.path) {
+        Some(source) => source.range(&symbol.source_range, encoding),
+        None => position::range_without_text(&symbol.source_range),
+    };
     Some(Hover {
         contents: HoverContents::Markup(MarkupContent {
             kind: MarkupKind::Markdown,
             value,
         }),
-        range: Some(position::range(
-            cache.text(&file.path),
-            &symbol.source_range,
-            encoding,
-        )),
+        range: Some(range),
     })
 }
 
@@ -134,8 +135,8 @@ pub fn definition_at(
     let mut cache = TextCache::new(sources);
     let file = index::file_for_uri(snapshot, uri)?;
     let byte = {
-        let text = cache.text(&file.path)?;
-        position::to_byte_offset(text, pos, encoding)?
+        let source = cache.file(&file.path)?;
+        source.to_byte_offset(pos, encoding)?
     };
     let target = index::resolve_at(snapshot, uri, byte)?;
     let symbol = snapshot.symbol_by_id(target)?;
@@ -156,8 +157,8 @@ pub fn references_at(
         return Vec::new();
     };
     let Some(byte) = (|| {
-        let text = cache.text(&file.path)?;
-        position::to_byte_offset(text, pos, encoding)
+        let source = cache.file(&file.path)?;
+        source.to_byte_offset(pos, encoding)
     })() else {
         return Vec::new();
     };
@@ -235,13 +236,14 @@ pub fn completion_at(
     let Some(file) = index::file_for_uri(snapshot, uri) else {
         return Vec::new();
     };
-    let Some(text) = sources.source(&file.path) else {
+    let mut cache = TextCache::new(sources);
+    let Some(source) = cache.file(&file.path) else {
         return Vec::new();
     };
-    let Some(byte) = position::to_byte_offset(&text, pos, encoding) else {
+    let Some(byte) = source.to_byte_offset(pos, encoding) else {
         return Vec::new();
     };
-    let prefix = identifier_prefix(&text, byte);
+    let prefix = identifier_prefix(source.text(), byte);
     let Some(file_id) = snapshot.file_id(&file.path) else {
         return Vec::new();
     };
@@ -383,11 +385,13 @@ pub fn diagnostics_for(
     let Some(path) = convert::uri_to_path(uri) else {
         return Vec::new();
     };
-    let text = sources.source(&path);
+    let source = sources
+        .source(&path)
+        .map(|text| SourceFile::new(text.into_owned()));
     snapshot
         .diagnostics
         .iter()
         .filter(|diagnostic| diagnostic.path == path)
-        .map(|diagnostic| convert::diagnostic_to_lsp(text.as_deref(), diagnostic, encoding))
+        .map(|diagnostic| convert::diagnostic_to_lsp(source.as_ref(), diagnostic, encoding))
         .collect()
 }

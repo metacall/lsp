@@ -133,6 +133,37 @@ impl LineIndex {
     }
 }
 
+/// Source text plus its line index.
+#[derive(Debug)]
+pub struct SourceFile {
+    text: String,
+    lines: LineIndex,
+}
+
+impl SourceFile {
+    /// Index the text once at construction.
+    pub fn new(text: impl Into<String>) -> Self {
+        let text = text.into();
+        let lines = LineIndex::new(&text);
+        Self { text, lines }
+    }
+
+    /// Borrow the source text.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// Convert an LSP position to a byte offset.
+    pub fn to_byte_offset(&self, pos: Position, encoding: Encoding) -> Option<usize> {
+        self.lines.to_byte_offset(&self.text, pos, encoding)
+    }
+
+    /// Convert a meta-ast byte range to an LSP range.
+    pub fn range(&self, range: &SourceRange, encoding: Encoding) -> Range {
+        self.lines.range(&self.text, range, encoding)
+    }
+}
+
 /// Fallback range when source text is unavailable: byte columns pass through.
 pub fn range_without_text(range: &SourceRange) -> Range {
     Range {
@@ -144,22 +175,6 @@ pub fn range_without_text(range: &SourceRange) -> Range {
             line: u32::try_from(range.end.line).unwrap_or(u32::MAX),
             character: u32::try_from(range.end.column).unwrap_or(u32::MAX),
         },
-    }
-}
-
-/// Convert an LSP position to a byte offset.
-///
-/// Builds a line index for the call. Use [`LineIndex`] directly when the same
-/// text serves several conversions.
-pub fn to_byte_offset(text: &str, pos: Position, encoding: Encoding) -> Option<usize> {
-    LineIndex::new(text).to_byte_offset(text, pos, encoding)
-}
-
-/// Convert a meta-ast byte range to an LSP range.
-pub fn range(text: Option<&str>, range: &SourceRange, encoding: Encoding) -> Range {
-    match text {
-        Some(text) => LineIndex::new(text).range(text, range, encoding),
-        None => range_without_text(range),
     }
 }
 
@@ -240,12 +255,12 @@ mod tests {
     #[test]
     fn multibyte_round_trip() {
         let text = "é中🐍 = 1\n";
-        let index = LineIndex::new(text);
+        let source = SourceFile::new(text);
         for encoding in [Encoding::Utf8, Encoding::Utf16] {
             for (byte, _) in text.char_indices() {
-                let position = index.to_position(text, byte, encoding);
+                let position = position(text, byte, encoding);
                 assert_eq!(
-                    index.to_byte_offset(text, position, encoding),
+                    source.to_byte_offset(position, encoding),
                     Some(byte),
                     "encoding {encoding:?} byte {byte}"
                 );
@@ -330,7 +345,7 @@ mod tests {
             end: meta_ast::model::LineColumn { line: 2, column: 7 },
         };
         assert_eq!(
-            range(None, &source_range, Encoding::Utf16),
+            range_without_text(&source_range),
             Range {
                 start: pos(2, 4),
                 end: pos(2, 7)
