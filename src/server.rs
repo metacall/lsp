@@ -695,8 +695,10 @@ fn handle_notification(
         let uri = params.text_document.uri.as_str().to_string();
         if state.buffers.close(uri.as_str()) {
             state.schedule(true);
+            Some(uri)
+        } else {
+            None
         }
-        Some(uri)
     } else if method == notification::DidSaveTextDocument::METHOD {
         let Ok(params) = serde_json::from_value::<DidSaveTextDocumentParams>(params) else {
             tracing::warn!("bad didSave params");
@@ -877,6 +879,15 @@ mod tests {
         }
     }
 
+    fn did_close(uri: &str) -> WireNotification {
+        WireNotification {
+            method: notification::DidCloseTextDocument::METHOD.to_string(),
+            params: serde_json::json!({
+                "textDocument": { "uri": uri }
+            }),
+        }
+    }
+
     #[test]
     fn cold_start_builds_index() {
         let (state, _rx, _dir) = state();
@@ -909,6 +920,22 @@ mod tests {
         handle_notification(&server, &mut state, did_open("file:///a.py", "python"));
         assert!(state.buffers.get("file:///a.py").is_some());
         assert!(rx.try_recv().is_ok(), "reindex expected");
+    }
+
+    #[test]
+    fn did_close_reports_only_tracked_documents() {
+        let (mut state, _rx, _dir) = state();
+        let (server, _client) = Connection::memory();
+
+        handle_notification(&server, &mut state, did_open("file:///a.py", "python"));
+        assert_eq!(
+            handle_notification(&server, &mut state, did_close("file:///a.py")),
+            Some("file:///a.py".to_string())
+        );
+        assert_eq!(
+            handle_notification(&server, &mut state, did_close("file:///notes.txt")),
+            None
+        );
     }
 
     fn watched(uri: &str) -> WireNotification {
