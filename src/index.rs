@@ -1,6 +1,6 @@
 //! Snapshot build plus read queries.
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -12,6 +12,7 @@ use meta_ast::{
 
 use crate::buffers::BufferStore;
 use crate::convert;
+use crate::shards;
 
 pub struct IndexSnapshot {
     pub id: SnapshotId,
@@ -71,13 +72,34 @@ pub trait SourceText {
 /// Reusable reindexer. Owns the engine extraction cache across passes.
 pub struct Reindexer {
     state: WatchState,
+    persist: bool,
 }
 
 impl Reindexer {
     pub fn new() -> Self {
         Self {
             state: WatchState::new(),
+            persist: false,
         }
+    }
+
+    /// Reindexer that writes `.meta-ast` shards after every rebuild.
+    pub fn with_persistence() -> Self {
+        Self {
+            state: WatchState::new(),
+            persist: true,
+        }
+    }
+
+    /// Seed the engine cache from `.meta-ast`. Missing or stale shards are
+    /// ignored; the next rebuild re-extracts what the cache lacks.
+    pub fn seed_from_shards(&mut self, root: &Path) -> shards::LoadStats {
+        shards::load(root, &mut self.state)
+    }
+
+    /// Number of extractions currently held in the engine cache.
+    pub fn cached_len(&self) -> usize {
+        self.state.cache().len()
     }
 
     /// Rebuild the snapshot, reusing unchanged extractions.
@@ -89,7 +111,17 @@ impl Reindexer {
     ) -> anyhow::Result<IndexSnapshot> {
         let (extractions, _change, diagnostics) =
             reanalyze_extractions(root, None, overlays, &mut self.state)?;
-        finish_snapshot(root, extractions, snapshot_raw, diagnostics)
+        let snapshot = finish_snapshot(root, extractions, snapshot_raw, diagnostics)?;
+        if self.persist {
+            let overlay_paths: HashSet<PathBuf> = overlays
+                .iter()
+                .map(|overlay| overlay.path.clone())
+                .collect();
+            if let Err(error) = shards::save(root, &snapshot, &overlay_paths) {
+                tracing::warn!(%error, "shard save failed, keeping prior index");
+            }
+        }
+        Ok(snapshot)
     }
 }
 

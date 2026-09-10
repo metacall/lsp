@@ -99,7 +99,15 @@ pub fn run_connection(connection: Connection) -> anyhow::Result<()> {
     }
     let (req_tx, req_rx) = crossbeam_channel::bounded(1);
     let (resp_tx, resp_rx) = crossbeam_channel::unbounded();
-    let mut reindexer = index::Reindexer::new();
+    let mut reindexer = index::Reindexer::with_persistence();
+    let warmed = reindexer.seed_from_shards(&root);
+    if warmed.loaded > 0 || warmed.skipped > 0 {
+        tracing::info!(
+            loaded = warmed.loaded,
+            skipped = warmed.skipped,
+            "cold start from .meta-ast"
+        );
+    }
     let first = Arc::new(reindexer.rebuild(&root, &[], 1)?);
     let worker = reindex::spawn_worker(req_rx, resp_tx, reindexer);
     let mut state = State::new(root, req_tx, encoding, first, progress_supported);
