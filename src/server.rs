@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use crossbeam_channel::{Receiver, Sender, select};
+use crossbeam_channel::{Receiver, Sender, TrySendError, select};
 use lsp_server::{Connection, Message};
 use lsp_server::{Notification as WireNotification, Request as WireRequest, RequestId, Response};
 use lsp_types::notification::Notification as LspNotification;
@@ -96,7 +96,7 @@ pub fn run_connection(connection: Connection) -> anyhow::Result<()> {
             "client has no dynamic watched-file registration; external changes stay untracked"
         );
     }
-    let (req_tx, req_rx) = crossbeam_channel::unbounded();
+    let (req_tx, req_rx) = crossbeam_channel::bounded(1);
     let (resp_tx, resp_rx) = crossbeam_channel::unbounded();
     let mut reindexer = index::Reindexer::new();
     let first = Arc::new(reindexer.rebuild(&root, &[], 1)?);
@@ -130,6 +130,7 @@ pub fn run_connection(connection: Connection) -> anyhow::Result<()> {
         if state.flush_due() {
             state.flush();
         }
+        state.flush_queued();
         state.pump_progress(&connection);
     }
     drop(state.req_tx);
@@ -203,6 +204,7 @@ struct State {
     progress_token: NumberOrString,
     last_reindex_ms: u128,
     warned_resolver: HashSet<PathBuf>,
+    queued: Option<ReindexReq>,
 }
 
 impl State {
@@ -231,6 +233,7 @@ impl State {
             progress_token: NumberOrString::String(String::new()),
             last_reindex_ms: 0,
             warned_resolver: HashSet::new(),
+            queued: None,
         }
     }
 
@@ -251,11 +254,27 @@ impl State {
             root: self.root.clone(),
             overlays,
         };
-        if self.req_tx.send(req).is_err() {
-            tracing::warn!("reindex worker gone, keeping prior snapshot");
-        }
+        self.queue(req);
         self.progress_pending =
             self.progress_supported && self.last_reindex_ms > PROGRESS_THRESHOLD_MS;
+    }
+
+    /// Send when the worker has room. Keep only the newest request otherwise.
+    fn queue(&mut self, req: ReindexReq) {
+        match self.req_tx.try_send(req) {
+            Ok(()) => {}
+            Err(TrySendError::Full(req)) => self.queued = Some(req),
+            Err(TrySendError::Disconnected(_)) => {
+                tracing::warn!("reindex worker gone, keeping prior snapshot");
+            }
+        }
+    }
+
+    /// Push the latest held request when the channel drains.
+    fn flush_queued(&mut self) {
+        if let Some(req) = self.queued.take() {
+            self.queue(req);
+        }
     }
 
     /// Start a progress operation when the previous reindex was slow.
@@ -361,6 +380,7 @@ impl SourceText for State {
 fn worker_gone(connection: &Connection, state: &mut State) {
     tracing::warn!("reindex worker gone");
     state.pending = None;
+    state.queued = None;
     state.end_progress(connection);
 }
 
@@ -1073,5 +1093,32 @@ mod tests {
             panic!("expected a progress notification");
         };
         assert_eq!(notification.method, "$/progress");
+    }
+
+    #[test]
+    fn full_request_queue_keeps_latest() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.py"), "def greet(): pass\n").unwrap();
+        let (req_tx, req_rx) = crossbeam_channel::bounded(1);
+        let snapshot = Arc::new(index::rebuild_from_inputs(dir.path(), &[], 1).unwrap());
+        let mut state = State::new(
+            dir.path().to_path_buf(),
+            req_tx,
+            Encoding::Utf16,
+            snapshot,
+            false,
+        );
+
+        state.schedule(true);
+        state.schedule(true);
+
+        let first = req_rx.try_recv().expect("first request");
+        assert_eq!(first.seq, 1);
+        assert!(state.queued.is_some(), "newest request waits for room");
+
+        state.flush_queued();
+        let second = req_rx.try_recv().expect("queued request");
+        assert_eq!(second.seq, 2);
+        assert!(state.queued.is_none());
     }
 }
