@@ -10,19 +10,33 @@ env:
 
 jobs:
   gates:
-    runs-on: ubuntu-latest
+    name: gates (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.94.0
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: lsp
+          key: ${{ matrix.target }}
       - name: Build
-        run: cargo build --all-features
+        run: cargo build --locked --all-features
       - name: Test
-        run: cargo test --all-features
+        run: cargo test --locked --all-features
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Format
         run: cargo fmt --check

@@ -227,8 +227,11 @@ mod tests {
 
     #[test]
     fn by_path_finds_open_doc() {
-        let store = store();
-        assert!(store.by_path(Path::new("/a.py")).is_some());
-        assert!(store.by_path(Path::new("/b.py")).is_none());
+        let path = std::env::temp_dir().join("a.py");
+        let uri = convert::path_to_uri(&path).unwrap();
+        let mut store = BufferStore::default();
+        assert!(store.open(uri.as_str(), 1, "python", "x = 1\n".to_string()));
+        assert!(store.by_path(&path).is_some());
+        assert!(store.by_path(&std::env::temp_dir().join("b.py")).is_none());
     }
 }

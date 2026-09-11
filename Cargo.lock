@@ -758,6 +758,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
+ "dunce",
  "lsp-server",
  "lsp-types",
  "meta-ast",
