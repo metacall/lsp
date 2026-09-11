@@ -14,6 +14,7 @@ pub fn uri_to_path(uri: &str) -> Option<PathBuf> {
 }
 
 pub fn path_to_uri(path: &Path) -> Option<Uri> {
+    let path = dunce::simplified(path);
     url::Url::from_file_path(path).ok()?.as_str().parse().ok()
 }
 
@@ -155,9 +156,17 @@ mod tests {
 
     #[test]
     fn uri_round_trip() {
-        let path = PathBuf::from("/tmp/poc_sample.py");
+        let path = std::env::temp_dir().join("poc_sample.py");
         let uri = path_to_uri(&path).unwrap();
         assert_eq!(uri_to_path(uri.as_str()).unwrap(), path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn path_to_uri_accepts_verbatim_paths() {
+        let path = std::env::temp_dir().join("poc_sample.py");
+        let verbatim = PathBuf::from(format!(r"\\?\{}", path.display()));
+        assert!(path_to_uri(&verbatim).is_some());
     }
 
     #[test]
