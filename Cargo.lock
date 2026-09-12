@@ -721,9 +721,9 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "meta-ast"
-version = "0.6.1"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22ffda37d9ad8a838a363955532dcd61e9dbd6da21197bf5998f676e7d0283c8"
+checksum = "b99ec18bb678980a75c1f4cb737677e26fb7c0a004b64e7acc80e4605ba61dc9"
 dependencies = [
  "anyhow",
  "blake3",

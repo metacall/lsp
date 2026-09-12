@@ -16,12 +16,12 @@ name = "meta_call_lsp"
 path = "src/lib.rs"
 
 [dependencies]
-meta-ast = { version = "0.6.1", features = ["metacall-deploy"] }
+meta-ast = { version = "0.7.0", features = ["metacall-deploy"] }
 crossbeam-channel = "0.5"
 dunce = "1.0"
 lsp-server = "0.10"
 lsp-types = "0.97"
-serde = { version = "1.0", features = ["derive"] }
+serde = "1.0"
 serde_json = "1.0"
 url = "2.5"
 anyhow = "1.0"
