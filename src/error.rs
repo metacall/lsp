@@ -8,6 +8,8 @@ const REQUEST_CANCELLED: i32 = -32800;
 pub enum ServerError {
     #[error("protocol: {0}")]
     Protocol(String),
+    #[error("protocol: {0}")]
+    InvalidParams(String),
     #[error("request cancelled")]
     Cancelled,
 }
@@ -16,6 +18,7 @@ impl ServerError {
     pub fn to_response(&self, id: RequestId) -> Response {
         let code = match self {
             ServerError::Protocol(_) => INVALID_PARAMS,
+            ServerError::InvalidParams(_) => INVALID_PARAMS,
             ServerError::Cancelled => REQUEST_CANCELLED,
         };
         Response {
