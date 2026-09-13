@@ -186,6 +186,17 @@ pub(crate) fn send_response_error(connection: &Connection, id: RequestId, error:
     send(connection, Message::Response(error.to_response(id)));
 }
 
+/// Parse the document URI of one notification; an unparsable URI is logged and dropped.
+fn document_uri(method: &str, uri: &lsp_types::Uri) -> Option<DocUri> {
+    match DocUri::try_from(uri) {
+        Ok(uri) => Some(uri),
+        Err(_) => {
+            tracing::warn!(%method, "unparsable document URI");
+            None
+        }
+    }
+}
+
 /// Handle one notification: no response; anything unactionable is logged and dropped.
 pub(crate) fn handle_notification(
     connection: &Connection,
@@ -198,8 +209,7 @@ pub(crate) fn handle_notification(
         let Some(params) = notification_params::<DidOpenTextDocumentParams>(&method, params) else {
             return;
         };
-        let Ok(uri) = DocUri::try_from(&params.text_document.uri) else {
-            tracing::warn!("didOpen with an unparsable document URI");
+        let Some(uri) = document_uri(&method, &params.text_document.uri) else {
             return;
         };
         if session.buffers.open(
@@ -221,8 +231,7 @@ pub(crate) fn handle_notification(
         else {
             return;
         };
-        let Ok(uri) = DocUri::try_from(&params.text_document.uri) else {
-            tracing::warn!("didChange with an unparsable document URI");
+        let Some(uri) = document_uri(&method, &params.text_document.uri) else {
             return;
         };
         if session.buffers.change(
@@ -239,8 +248,7 @@ pub(crate) fn handle_notification(
         else {
             return;
         };
-        let Ok(uri) = DocUri::try_from(&params.text_document.uri) else {
-            tracing::warn!("didClose with an unparsable document URI");
+        let Some(uri) = document_uri(&method, &params.text_document.uri) else {
             return;
         };
         if session.buffers.close(&uri) && session.indexable(&uri) {
@@ -250,8 +258,7 @@ pub(crate) fn handle_notification(
         let Some(params) = notification_params::<DidSaveTextDocumentParams>(&method, params) else {
             return;
         };
-        let Ok(uri) = DocUri::try_from(&params.text_document.uri) else {
-            tracing::warn!("didSave with an unparsable document URI");
+        let Some(uri) = document_uri(&method, &params.text_document.uri) else {
             return;
         };
         session.on_save(&uri, params.text.as_deref());
