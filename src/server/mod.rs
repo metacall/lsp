@@ -202,9 +202,9 @@ impl Server<Ready> {
                 LoopControl::Exit => break 'serve,
             }
             session.flush_batch();
-            session.pump_progress(&connection);
+            session.progress.pump(&connection);
         }
-        session.shutdown(&connection);
+        session.progress.abandon(&connection);
         drop(session);
         if worker.join().is_err() {
             return Err(anyhow::anyhow!("reindex worker panicked"));
@@ -301,11 +301,13 @@ fn handle_client_message(
                 return Ok(LoopControl::Exit);
             }
             handle_notification(connection, session, cancel, notification);
-            session.pump_progress(connection);
+            session.progress.pump(connection);
             Ok(LoopControl::Continue)
         }
         Message::Response(response) => {
-            session.on_progress_ack(connection, &response);
+            session
+                .progress
+                .on_ack(connection, &response, session.applied_seq);
             Ok(LoopControl::Continue)
         }
     }

@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crossbeam_channel::Sender;
-use lsp_server::{Connection, Response};
+use lsp_server::Connection;
 
 use crate::buffers::BufferStore;
 use crate::error::ServerError;
@@ -48,9 +48,9 @@ pub(crate) struct Session {
     pub(crate) buffers: BufferStore,
     pub(crate) warned_resolvers: BTreeSet<String>,
     index: IndexState,
-    applied_seq: u64,
+    pub(crate) applied_seq: u64,
     scheduler: Scheduler,
-    progress: ProgressTracker,
+    pub(crate) progress: ProgressTracker,
     /// True when workspace state changed and no request carries it yet.
     dirty: bool,
 }
@@ -131,18 +131,6 @@ impl Session {
         } else if self.scheduler.is_gone() {
             self.dirty = false;
         }
-    }
-
-    pub(crate) fn pump_progress(&mut self, connection: &Connection) {
-        self.progress.pump(connection);
-    }
-
-    pub(crate) fn on_progress_ack(&mut self, connection: &Connection, response: &Response) {
-        self.progress.on_ack(connection, response, self.applied_seq);
-    }
-
-    pub(crate) fn shutdown(&mut self, connection: &Connection) {
-        self.progress.abandon(connection);
     }
 
     /// Apply one reindex response: stale seqs drop, newest wins; a failed pass disables the index.
