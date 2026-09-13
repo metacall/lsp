@@ -1,0 +1,20 @@
+---
+source: tests/mixed_fixture.rs
+expression: hover
+---
+{
+  "contents": {
+    "kind": "markdown",
+    "value": "**multiply** (function)\n\n```python\n(units, price)\n```\n\nTotal price for a number of units."
+  },
+  "range": {
+    "start": {
+      "line": 3,
+      "character": 0
+    },
+    "end": {
+      "line": 5,
+      "character": 24
+    }
+  }
+}

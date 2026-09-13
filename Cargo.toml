@@ -30,6 +30,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
+insta = { version = "1", features = ["json"] }
 proptest = "1"
 tempfile = "3.27"
 

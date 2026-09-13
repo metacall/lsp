@@ -1,0 +1,13 @@
+---
+source: tests/mixed_fixture.rs
+expression: items
+---
+[
+  {
+    "label": "multiply",
+    "kind": 3,
+    "detail": "(units, price)",
+    "sortText": "2multiply",
+    "filterText": "multiply"
+  }
+]
