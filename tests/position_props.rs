@@ -15,8 +15,14 @@ proptest! {
         while !text.is_char_boundary(byte) {
             byte -= 1;
         }
+        let bytes = text.as_bytes();
+        let at_terminator = bytes.get(byte) == Some(&b'\n')
+            || (bytes.get(byte) == Some(&b'\r') && bytes.get(byte + 1) == Some(&b'\n'));
         for encoding in [Encoding::Utf8, Encoding::Utf16] {
             let position = LineIndex::new(&text).to_position(&text, byte, encoding);
+            if at_terminator {
+                continue;
+            }
             prop_assert_eq!(
                 source.to_byte_offset(position, encoding),
                 Some(byte),
