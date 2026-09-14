@@ -94,7 +94,7 @@ pub fn diagnostic_to_lsp(
         severity: Some(severity(diagnostic.severity)),
         code: None,
         code_description: None,
-        source: Some("meta-ast".to_string()),
+        source: Some(crate::server::ids::DIAGNOSTIC_SOURCE.to_string()),
         message: diagnostic.message.clone(),
         related_information: None,
         tags: None,

@@ -1,6 +1,7 @@
 //! Sync LSP loop over a phase-typed connection.
 mod capabilities;
 mod dispatch;
+pub(crate) mod ids;
 mod progress;
 mod scheduler;
 mod session;
@@ -20,8 +21,8 @@ use crate::server::capabilities::{
     capabilities, register_watched_files, root_from_params, supports_pull_diagnostics,
     supports_watched_files,
 };
-use crate::server::capabilities::SERVER_NAME;
 use crate::server::dispatch::{handle_notification, handle_request};
+use crate::server::ids::SERVER_NAME;
 use crate::server::session::Session;
 use crate::types::LogLevel;
 

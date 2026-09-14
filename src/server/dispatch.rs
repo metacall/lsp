@@ -159,12 +159,17 @@ fn query_document<'a, T: serde::Serialize>(
 
 /// Result id of one pull report: generation, plus the version for an open document.
 fn diagnostic_result_id(snapshot: &crate::index::IndexSnapshot, uri: &DocUri) -> String {
+    use super::ids::DIAGNOSTIC_SOURCE;
     let version = uri
         .to_path()
         .and_then(|path| snapshot.document_version(&path));
     match version {
-        Some(version) => format!("meta-ast:{}:{}", snapshot.generation(), version.get()),
-        None => format!("meta-ast:{}", snapshot.generation()),
+        Some(version) => format!(
+            "{DIAGNOSTIC_SOURCE}:{}:{}",
+            snapshot.generation(),
+            version.get()
+        ),
+        None => format!("{DIAGNOSTIC_SOURCE}:{}", snapshot.generation()),
     }
 }
 

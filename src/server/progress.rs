@@ -1,4 +1,5 @@
 //! Client-visible work-done progress for reindex operations.
+use super::ids;
 use lsp_server::{
     Connection, Message, Notification as WireNotification, Request as WireRequest, RequestId,
     Response,
@@ -105,8 +106,8 @@ impl ProgressTracker {
 
     fn start(&mut self, connection: &Connection, seq: u64) {
         self.next_id += 1;
-        let token = NumberOrString::String(format!("meta-ast-reindex-{}", self.next_id));
-        let ack = RequestId::from(format!("meta-ast-progress-{}", self.next_id));
+        let token = NumberOrString::String(ids::reindex_progress_token(self.next_id));
+        let ack = ids::reindex_progress_ack(self.next_id);
         let create = WireRequest {
             id: ack.clone(),
             method: WorkDoneProgressCreate::METHOD.to_string(),
@@ -161,13 +162,13 @@ mod tests {
 
     fn tracker() -> ProgressTracker {
         let mut tracker = ProgressTracker::new(true);
-        tracker.token = NumberOrString::String("meta-ast-reindex-1".to_string());
+        tracker.token = NumberOrString::String(ids::reindex_progress_token(1));
         tracker
     }
 
     fn launch(seq: u64) -> (ProgressTracker, RequestId) {
         let mut tracker = tracker();
-        let ack = RequestId::from(format!("meta-ast-progress-{seq}"));
+        let ack = ids::reindex_progress_ack(seq);
         tracker.progress = Progress::Launching {
             ack: ack.clone(),
             seq,
@@ -229,7 +230,7 @@ mod tests {
         assert_eq!(tracker.progress, Progress::Active { seq: 7 });
         assert_eq!(
             next_progress_message(&client).token,
-            NumberOrString::String("meta-ast-reindex-1".to_string())
+            NumberOrString::String(ids::reindex_progress_token(1))
         );
     }
 

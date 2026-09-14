@@ -1,6 +1,6 @@
 //! Capability negotiation and dynamic registrations.
 use anyhow::Context;
-use lsp_server::{Connection, Message, Request as WireRequest, RequestId};
+use lsp_server::{Connection, Message, Request as WireRequest};
 use lsp_types::notification::DidChangeWatchedFiles;
 use lsp_types::notification::Notification as _;
 use lsp_types::request::{RegisterCapability, Request as _};
@@ -13,9 +13,8 @@ use lsp_types::{
 };
 
 use crate::position::Encoding;
+use crate::server::ids::{WATCHED_FILES_REGISTRATION, watched_files_request_id};
 use crate::types::{DocUri, RootDir};
-
-pub(crate) const SERVER_NAME: &str = "meta-call-lsp";
 
 /// Files whose contents shape engine resolver state for the process lifetime.
 const RESOLVER_CONFIGS: [&str; 5] = [
@@ -100,7 +99,7 @@ pub(crate) fn is_resolver_config(path: &std::path::Path) -> bool {
 pub(crate) fn register_watched_files(connection: &Connection) -> anyhow::Result<()> {
     let params = watched_files_registration()?;
     let request = WireRequest {
-        id: RequestId::from("meta-ast-lsp-register-watched-files".to_string()),
+        id: watched_files_request_id(),
         method: RegisterCapability::METHOD.to_string(),
         params: serde_json::to_value(params)?,
     };
@@ -122,7 +121,7 @@ fn watched_files_registration() -> anyhow::Result<RegistrationParams> {
     let options = lsp_types::DidChangeWatchedFilesRegistrationOptions { watchers };
     Ok(RegistrationParams {
         registrations: vec![Registration {
-            id: "meta-ast-lsp-watched-files".to_string(),
+            id: WATCHED_FILES_REGISTRATION.to_string(),
             method: DidChangeWatchedFiles::METHOD.to_string(),
             register_options: Some(serde_json::to_value(options)?),
         }],
