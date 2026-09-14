@@ -4,11 +4,17 @@ use std::path::{Path, PathBuf};
 
 use lsp_types::{Range, TextDocumentContentChangeEvent};
 
-use crate::convert;
 use crate::position::{self, Encoding};
+use crate::types::{DocUri, DocVersion};
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum OpenOutcome {
+    Indexed,
+    Unsupported,
+}
 
 pub struct OpenDoc {
-    pub version: i32,
+    pub version: DocVersion,
     pub lang: meta_ast::LangId,
     pub text: String,
     pub path: Option<PathBuf>,
@@ -16,37 +22,44 @@ pub struct OpenDoc {
 
 #[derive(Default)]
 pub struct BufferStore {
-    docs: HashMap<String, OpenDoc>,
+    docs: HashMap<DocUri, OpenDoc>,
 }
 
 impl BufferStore {
-    pub fn open(&mut self, uri: &str, version: i32, language_id: &str, text: String) -> bool {
+    pub fn open(
+        &mut self,
+        uri: &DocUri,
+        version: DocVersion,
+        language_id: &str,
+        text: String,
+    ) -> OpenOutcome {
         let Some(lang) = lang_for(uri, language_id) else {
-            return false;
+            return OpenOutcome::Unsupported;
         };
         self.docs.insert(
-            uri.to_string(),
+            uri.clone(),
             OpenDoc {
                 version,
                 lang,
                 text,
-                path: convert::uri_to_path(uri),
+                path: uri.to_path(),
             },
         );
-        true
+        OpenOutcome::Indexed
     }
 
     pub fn change(
         &mut self,
-        uri: &str,
-        version: i32,
+        uri: &DocUri,
+        version: DocVersion,
         changes: &[TextDocumentContentChangeEvent],
         encoding: Encoding,
     ) -> bool {
         let Some(doc) = self.docs.get_mut(uri) else {
             return false;
         };
-        if version <= doc.version {
+        // A stale notification is a client protocol violation: rejected, never repaired.
+        if !version.is_newer_than(doc.version) {
             return false;
         }
         for change in changes {
@@ -59,7 +72,7 @@ impl BufferStore {
         true
     }
 
-    pub fn save(&mut self, uri: &str, text: &str) -> bool {
+    pub fn save(&mut self, uri: &DocUri, text: &str) -> bool {
         let Some(doc) = self.docs.get_mut(uri) else {
             return false;
         };
@@ -70,11 +83,11 @@ impl BufferStore {
         true
     }
 
-    pub fn close(&mut self, uri: &str) -> bool {
+    pub fn close(&mut self, uri: &DocUri) -> bool {
         self.docs.remove(uri).is_some()
     }
 
-    pub fn get(&self, uri: &str) -> Option<&OpenDoc> {
+    pub fn get(&self, uri: &DocUri) -> Option<&OpenDoc> {
         self.docs.get(uri)
     }
 
@@ -84,22 +97,23 @@ impl BufferStore {
             .find(|doc| doc.path.as_deref() == Some(path))
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (&String, &OpenDoc)> {
+    pub fn iter(&self) -> impl Iterator<Item = (&DocUri, &OpenDoc)> {
         self.docs.iter()
     }
 }
 
-fn lang_for(uri: &str, language_id: &str) -> Option<meta_ast::LangId> {
+fn lang_for(uri: &DocUri, language_id: &str) -> Option<meta_ast::LangId> {
     if let Some(lang) = lang_from_id(language_id) {
         return Some(lang);
     }
-    let path = convert::uri_to_path(uri)?;
-    meta_ast::detect_language(&path)
+    uri.to_path()
+        .and_then(|path| meta_ast::detect_language(&path))
 }
 
+/// Exact LSP language ids and aliases; an unknown spelling falls through to `detect_language`.
 fn lang_from_id(id: &str) -> Option<meta_ast::LangId> {
     use meta_ast::LangId;
-    match id.to_ascii_lowercase().as_str() {
+    match id {
         "python" | "py" => Some(LangId::Python),
         "javascript" | "js" | "jsx" => Some(LangId::JavaScript),
         "typescript" | "ts" => Some(LangId::TypeScript),
@@ -128,11 +142,22 @@ fn apply_patch(text: &mut String, range: Range, replacement: &str, encoding: Enc
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::convert;
+
+    use crate::testutil::doc_uri;
     use lsp_types::Position;
 
     fn store() -> BufferStore {
         let mut store = BufferStore::default();
-        assert!(store.open("file:///a.py", 1, "python", "x = 1\n".to_string()));
+        assert_eq!(
+            store.open(
+                &doc_uri("file:///a.py"),
+                DocVersion::from(1),
+                "python",
+                "x = 1\n".to_string()
+            ),
+            OpenOutcome::Indexed
+        );
         store
     }
 
@@ -147,22 +172,80 @@ mod tests {
     #[test]
     fn open_rejects_unknown_language() {
         let mut store = BufferStore::default();
-        assert!(!store.open("file:///a.zzz", 1, "zzz", "x".to_string()));
-        assert!(store.get("file:///a.zzz").is_none());
+        assert_eq!(
+            store.open(
+                &doc_uri("file:///a.zzz"),
+                DocVersion::from(1),
+                "zzz",
+                "x".to_string()
+            ),
+            OpenOutcome::Unsupported
+        );
+        assert!(store.get(&doc_uri("file:///a.zzz")).is_none());
     }
 
     #[test]
     fn change_applies_full_text() {
         let mut store = store();
-        assert!(store.change("file:///a.py", 2, &[full_text("y = 2\n")], Encoding::Utf16));
-        assert_eq!(store.get("file:///a.py").unwrap().text, "y = 2\n");
+        assert!(store.change(
+            &doc_uri("file:///a.py"),
+            DocVersion::from(2),
+            &[full_text("y = 2\n")],
+            Encoding::Utf16
+        ));
+        assert_eq!(store.get(&doc_uri("file:///a.py")).unwrap().text, "y = 2\n");
     }
 
     #[test]
-    fn change_ignores_stale_version() {
+    fn empty_change_list_keeps_the_version() {
         let mut store = store();
-        assert!(!store.change("file:///a.py", 1, &[full_text("y = 2\n")], Encoding::Utf16));
-        assert_eq!(store.get("file:///a.py").unwrap().text, "x = 1\n");
+        assert!(!store.change(
+            &doc_uri("file:///a.py"),
+            DocVersion::from(0),
+            &[],
+            Encoding::Utf16
+        ));
+        assert_eq!(
+            store.get(&doc_uri("file:///a.py")).unwrap().version,
+            DocVersion::from(1)
+        );
+    }
+
+    #[test]
+    fn change_ignores_every_stale_version() {
+        let mut store = store();
+        let range = Range {
+            start: Position {
+                line: 0,
+                character: 0,
+            },
+            end: Position {
+                line: 0,
+                character: 1,
+            },
+        };
+        assert!(!store.change(
+            &doc_uri("file:///a.py"),
+            DocVersion::from(1),
+            &[TextDocumentContentChangeEvent {
+                range: Some(range),
+                range_length: None,
+                text: "z".to_string(),
+            }],
+            Encoding::Utf16,
+        ));
+        assert_eq!(store.get(&doc_uri("file:///a.py")).unwrap().text, "x = 1\n");
+        assert!(!store.change(
+            &doc_uri("file:///a.py"),
+            DocVersion::from(1),
+            &[full_text("y = 2\n")],
+            Encoding::Utf16
+        ));
+        assert_eq!(store.get(&doc_uri("file:///a.py")).unwrap().text, "x = 1\n");
+        assert_eq!(
+            store.get(&doc_uri("file:///a.py")).unwrap().version,
+            DocVersion::from(1)
+        );
     }
 
     #[test]
@@ -179,8 +262,8 @@ mod tests {
             },
         };
         assert!(store.change(
-            "file:///a.py",
-            2,
+            &doc_uri("file:///a.py"),
+            DocVersion::from(2),
             &[TextDocumentContentChangeEvent {
                 range: Some(range),
                 range_length: None,
@@ -188,13 +271,21 @@ mod tests {
             }],
             Encoding::Utf16,
         ));
-        assert_eq!(store.get("file:///a.py").unwrap().text, "y = 1\n");
+        assert_eq!(store.get(&doc_uri("file:///a.py")).unwrap().text, "y = 1\n");
     }
 
     #[test]
     fn range_patch_honors_utf16_columns() {
         let mut store = BufferStore::default();
-        assert!(store.open("file:///a.py", 1, "python", "x = \"🐍\"\n".to_string()));
+        assert_eq!(
+            store.open(
+                &doc_uri("file:///a.py"),
+                DocVersion::from(1),
+                "python",
+                "x = \"🐍\"\n".to_string()
+            ),
+            OpenOutcome::Indexed
+        );
         let range = Range {
             start: Position {
                 line: 0,
@@ -206,8 +297,8 @@ mod tests {
             },
         };
         assert!(store.change(
-            "file:///a.py",
-            2,
+            &doc_uri("file:///a.py"),
+            DocVersion::from(2),
             &[TextDocumentContentChangeEvent {
                 range: Some(range),
                 range_length: None,
@@ -215,14 +306,17 @@ mod tests {
             }],
             Encoding::Utf16,
         ));
-        assert_eq!(store.get("file:///a.py").unwrap().text, "x = \"z\"\n");
+        assert_eq!(
+            store.get(&doc_uri("file:///a.py")).unwrap().text,
+            "x = \"z\"\n"
+        );
     }
 
     #[test]
     fn save_reports_real_changes_only() {
         let mut store = store();
-        assert!(!store.save("file:///a.py", "x = 1\n"));
-        assert!(store.save("file:///a.py", "x = 2\n"));
+        assert!(!store.save(&doc_uri("file:///a.py"), "x = 1\n"));
+        assert!(store.save(&doc_uri("file:///a.py"), "x = 2\n"));
     }
 
     #[test]
@@ -230,7 +324,15 @@ mod tests {
         let path = std::env::temp_dir().join("a.py");
         let uri = convert::path_to_uri(&path).unwrap();
         let mut store = BufferStore::default();
-        assert!(store.open(uri.as_str(), 1, "python", "x = 1\n".to_string()));
+        assert_eq!(
+            store.open(
+                &doc_uri(uri.as_str()),
+                DocVersion::from(1),
+                "python",
+                "x = 1\n".to_string()
+            ),
+            OpenOutcome::Indexed
+        );
         assert!(store.by_path(&path).is_some());
         assert!(store.by_path(&std::env::temp_dir().join("b.py")).is_none());
     }

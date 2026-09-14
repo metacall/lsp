@@ -1,14 +1,9 @@
-//! Position encoding negotiation and byte-canonical coordinates.
-//!
-//! `meta-ast` reports byte offsets and byte columns (tree-sitter points).
-//! LSP reports columns in the negotiated encoding. This module converts
-//! between the two at the protocol boundary. Byte offsets stay the internal
-//! currency everywhere else.
+//! Byte-canonical coordinates. The engine speaks byte offsets and byte columns;
+//! LSP speaks the negotiated encoding, so conversion happens only at this boundary.
 
 use lsp_types::{ClientCapabilities, Position, PositionEncodingKind, Range};
 use meta_ast::model::SourceRange;
 
-/// Column encoding agreed with the client.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Encoding {
     Utf8,
@@ -24,7 +19,6 @@ impl Encoding {
     }
 }
 
-/// Pick an encoding from the client list.
 pub fn negotiate(caps: &ClientCapabilities) -> Encoding {
     let offered = caps
         .general
@@ -45,6 +39,21 @@ fn units_of(ch: char, encoding: Encoding) -> usize {
     }
 }
 
+/// Byte offset of the visible line end; a `\r` before `\n` is terminator, as clients count columns.
+fn line_end(text: &str, start: usize) -> usize {
+    match text[start..].find('\n') {
+        Some(offset) => {
+            let end = start + offset;
+            if end > start && text.as_bytes()[end - 1] == b'\r' {
+                end - 1
+            } else {
+                end
+            }
+        }
+        None => text.len(),
+    }
+}
+
 fn clamp_boundary(text: &str, byte: usize) -> usize {
     let mut byte = byte.min(text.len());
     while !text.is_char_boundary(byte) {
@@ -53,17 +62,13 @@ fn clamp_boundary(text: &str, byte: usize) -> usize {
     byte
 }
 
-/// Precomputed line starts for one text buffer.
-///
-/// Building the index costs one scan of the text. Each conversion after that
-/// costs O(log lines) plus the characters on one line.
+/// Precomputed line starts: one scan to build, then O(log lines) per conversion.
 #[derive(Debug)]
 pub struct LineIndex {
     starts: Vec<usize>,
 }
 
 impl LineIndex {
-    /// Scan the text once and record the byte offset of every line start.
     pub fn new(text: &str) -> Self {
         let mut starts = Vec::new();
         starts.push(0);
@@ -79,17 +84,9 @@ impl LineIndex {
         self.starts.get(line as usize).copied()
     }
 
-    fn line_end(&self, text: &str, start: usize) -> usize {
-        match text[start..].find('\n') {
-            Some(offset) => start + offset,
-            None => text.len(),
-        }
-    }
-
-    /// Convert an LSP position to a byte offset.
     pub fn to_byte_offset(&self, text: &str, pos: Position, encoding: Encoding) -> Option<usize> {
         let start = self.line_start(pos.line)?;
-        let end = self.line_end(text, start);
+        let end = line_end(text, start);
         let line = &text[start..end];
         let target = pos.character as usize;
         let mut units = 0usize;
@@ -106,7 +103,6 @@ impl LineIndex {
         Some(end)
     }
 
-    /// Convert a byte offset to an LSP position.
     pub fn to_position(&self, text: &str, byte: usize, encoding: Encoding) -> Position {
         let byte = clamp_boundary(text, byte);
         let line = self
@@ -114,7 +110,8 @@ impl LineIndex {
             .partition_point(|&start| start <= byte)
             .saturating_sub(1);
         let start = self.starts[line];
-        let character = text[start..byte]
+        let visible_end = byte.min(line_end(text, start));
+        let character = text[start..visible_end]
             .chars()
             .map(|ch| units_of(ch, encoding))
             .sum::<usize>();
@@ -124,7 +121,6 @@ impl LineIndex {
         }
     }
 
-    /// Convert a meta-ast byte range to an LSP range.
     pub fn range(&self, text: &str, range: &SourceRange, encoding: Encoding) -> Range {
         Range {
             start: self.to_position(text, range.byte_start, encoding),
@@ -133,7 +129,6 @@ impl LineIndex {
     }
 }
 
-/// Source text plus its line index.
 #[derive(Debug)]
 pub struct SourceFile {
     text: String,
@@ -141,24 +136,20 @@ pub struct SourceFile {
 }
 
 impl SourceFile {
-    /// Index the text once at construction.
     pub fn new(text: impl Into<String>) -> Self {
         let text = text.into();
         let lines = LineIndex::new(&text);
         Self { text, lines }
     }
 
-    /// Borrow the source text.
     pub fn text(&self) -> &str {
         &self.text
     }
 
-    /// Convert an LSP position to a byte offset.
     pub fn to_byte_offset(&self, pos: Position, encoding: Encoding) -> Option<usize> {
         self.lines.to_byte_offset(&self.text, pos, encoding)
     }
 
-    /// Convert a meta-ast byte range to an LSP range.
     pub fn range(&self, range: &SourceRange, encoding: Encoding) -> Range {
         self.lines.range(&self.text, range, encoding)
     }
@@ -242,7 +233,6 @@ mod tests {
 
     #[test]
     fn utf16_columns_count_surrogate_pairs() {
-        // "🐍" is 4 UTF-8 bytes and 2 UTF-16 code units.
         let text = "x = \"🐍\"\n";
         let snake = text.find('🐍').unwrap();
         assert_eq!(position(text, snake, Encoding::Utf8), pos(0, 5));
@@ -293,10 +283,49 @@ mod tests {
     fn position_inside_character_snaps_to_start() {
         let text = "🐍\n";
         let index = LineIndex::new(text);
-        // UTF-16 column 1 is inside the surrogate pair.
         assert_eq!(
             index.to_byte_offset(text, pos(0, 1), Encoding::Utf16),
             Some(0)
+        );
+    }
+
+    #[test]
+    fn crlf_lines_match_lf_columns() {
+        let lf = "ab\ncd\n";
+        let crlf = "ab\r\ncd\r\n";
+        for encoding in [Encoding::Utf8, Encoding::Utf16] {
+            let lf_index = LineIndex::new(lf);
+            let crlf_index = LineIndex::new(crlf);
+            assert_eq!(
+                crlf_index.to_position(crlf, 2, encoding),
+                lf_index.to_position(lf, 2, encoding)
+            );
+            assert_eq!(
+                crlf_index.to_byte_offset(crlf, pos(0, 2), encoding),
+                Some(2)
+            );
+            assert_eq!(
+                crlf_index.to_byte_offset(crlf, pos(0, 99), encoding),
+                Some(2)
+            );
+            assert_eq!(
+                crlf_index.to_byte_offset(crlf, pos(1, 0), encoding),
+                Some(4)
+            );
+            assert_eq!(crlf_index.to_position(crlf, 4, encoding), pos(1, 0));
+        }
+    }
+
+    #[test]
+    fn crlf_terminator_bytes_map_to_end_of_line() {
+        let text = "ab\r\ncd";
+        let index = LineIndex::new(text);
+        assert_eq!(index.to_position(text, 2, Encoding::Utf16), pos(0, 2));
+        assert_eq!(index.to_position(text, 3, Encoding::Utf16), pos(0, 2));
+        assert_eq!(index.to_position(text, 4, Encoding::Utf16), pos(1, 0));
+        assert_eq!(
+            index.to_byte_offset(text, pos(0, 2), Encoding::Utf16),
+            Some(2)
         );
     }
 

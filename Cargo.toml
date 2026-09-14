@@ -16,12 +16,12 @@ name = "meta_call_lsp"
 path = "src/lib.rs"
 
 [dependencies]
-meta-ast = { version = "0.6.1", features = ["metacall-deploy"] }
+meta-ast = { version = "0.7.0", features = ["metacall-deploy"] }
 crossbeam-channel = "0.5"
 dunce = "1.0"
 lsp-server = "0.10"
 lsp-types = "0.97"
-serde = { version = "1.0", features = ["derive"] }
+serde = "1.0"
 serde_json = "1.0"
 url = "2.5"
 anyhow = "1.0"
@@ -30,9 +30,23 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+insta = { version = "1", features = ["json"] }
 proptest = "1"
 tempfile = "3.27"
+
+[[bench]]
+name = "index"
+harness = false
 
 [profile.release]
 strip = "symbols"
 lto = "thin"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+redundant_clone = "warn"
+needless_collect = "warn"

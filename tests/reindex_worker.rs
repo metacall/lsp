@@ -1,11 +1,16 @@
+#![expect(clippy::unwrap_used, reason = "a test may abort on setup failure")]
 use std::borrow::Cow;
 use std::path::Path;
-use std::sync::Arc;
 use std::time::Duration;
 
-use meta_call_lsp::buffers::BufferStore;
+use meta_call_lsp::buffers::{BufferStore, OpenOutcome};
 use meta_call_lsp::index::{IndexSnapshot, SourceText};
 use meta_call_lsp::position::Encoding;
+use meta_call_lsp::types::{DocUri, DocVersion};
+
+fn doc_uri(value: &str) -> DocUri {
+    DocUri::try_from(value).expect("document URI")
+}
 use meta_call_lsp::reindex::{ReindexReq, spawn_worker};
 use meta_call_lsp::{convert, handlers, index};
 
@@ -29,14 +34,12 @@ fn workspace() -> (tempfile::TempDir, String) {
 
 fn req(
     seq: u64,
-    raw: u32,
     dir: &std::path::Path,
     buffers: &BufferStore,
     tx: &crossbeam_channel::Sender<ReindexReq>,
 ) {
     tx.send(ReindexReq {
         seq,
-        snapshot_raw: raw,
         root: dir.to_path_buf(),
         overlays: index::collect_inputs(dir, buffers),
     })
@@ -46,7 +49,7 @@ fn req(
 fn recv_until(
     rx: &crossbeam_channel::Receiver<meta_call_lsp::reindex::ReindexResp>,
     seq: u64,
-) -> IndexSnapshot {
+) -> std::sync::Arc<IndexSnapshot> {
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -62,28 +65,34 @@ fn recv_until(
 fn burst_coalesces_to_latest() {
     let (dir, uri) = workspace();
     let mut buffers = BufferStore::default();
-    assert!(buffers.open(uri.as_str(), 1, "python", APP.to_string()));
+    assert_eq!(
+        buffers.open(
+            &doc_uri(uri.as_str()),
+            DocVersion::from(1),
+            "python",
+            APP.to_string()
+        ),
+        OpenOutcome::Indexed
+    );
     let (req_tx, req_rx) = crossbeam_channel::unbounded();
     let (resp_tx, resp_rx) = crossbeam_channel::unbounded();
     let worker = spawn_worker(req_rx, resp_tx, index::Reindexer::new());
     for version in 2..=6 {
-        assert!(buffers.open(
-            uri.as_str(),
-            version,
-            "python",
-            format!("{APP}\n\ndef marker_{version}(): pass\n")
-        ));
-        req(
-            version as u64,
-            version as u32,
-            dir.path(),
-            &buffers,
-            &req_tx,
+        assert_eq!(
+            buffers.open(
+                &doc_uri(uri.as_str()),
+                DocVersion::from(version),
+                "python",
+                format!("{APP}\n\ndef marker_{version}(): pass\n")
+            ),
+            OpenOutcome::Indexed
         );
+        req(version as u64, dir.path(), &buffers, &req_tx);
     }
     let snapshot = recv_until(&resp_rx, 6);
     let sources = DiskSources;
-    let symbols = handlers::document_symbols(&snapshot, &sources, uri.as_str(), Encoding::Utf16);
+    let mut ctx = handlers::QueryCtx::new(&snapshot, &sources, Encoding::Utf16);
+    let symbols = handlers::document_symbols(&mut ctx, &doc_uri(uri.as_str()));
     assert!(symbols.iter().any(|symbol| symbol.name == "marker_6"));
     drop(req_tx);
     worker.join().unwrap();
@@ -93,30 +102,34 @@ fn burst_coalesces_to_latest() {
 fn readers_hold_old_snapshot_during_reindex() {
     let (dir, uri) = workspace();
     let buffers = BufferStore::default();
-    let old = Arc::new(
-        index::rebuild_from_inputs(dir.path(), &index::collect_inputs(dir.path(), &buffers), 1)
-            .unwrap(),
-    );
+    let old = index::rebuild_from_inputs(dir.path(), &index::collect_inputs(dir.path(), &buffers))
+        .unwrap();
     let (req_tx, req_rx) = crossbeam_channel::unbounded();
     let (resp_tx, resp_rx) = crossbeam_channel::unbounded();
     let worker = spawn_worker(req_rx, resp_tx, index::Reindexer::new());
     let mut next = BufferStore::default();
-    assert!(next.open(
-        uri.as_str(),
-        2,
-        "python",
-        format!("{APP}\n\ndef extra(): pass\n")
-    ));
-    req(1, 2, dir.path(), &next, &req_tx);
+    assert_eq!(
+        next.open(
+            &doc_uri(uri.as_str()),
+            DocVersion::from(2),
+            "python",
+            format!("{APP}\n\ndef extra(): pass\n")
+        ),
+        OpenOutcome::Indexed
+    );
+    req(1, dir.path(), &next, &req_tx);
     let pos = lsp_types::Position {
         line: 0,
         character: 5,
     };
     let sources = DiskSources;
-    assert!(handlers::hover_at(&old, &sources, uri.as_str(), pos, Encoding::Utf16).is_some());
+    let mut ctx = handlers::QueryCtx::new(&old, &sources, Encoding::Utf16);
+    assert!(handlers::hover_at(&mut ctx, &doc_uri(uri.as_str()), pos).is_some());
     let snapshot = recv_until(&resp_rx, 1);
-    assert!(handlers::hover_at(&old, &sources, uri.as_str(), pos, Encoding::Utf16).is_some());
-    let symbols = handlers::document_symbols(&snapshot, &sources, uri.as_str(), Encoding::Utf16);
+    let mut ctx = handlers::QueryCtx::new(&old, &sources, Encoding::Utf16);
+    assert!(handlers::hover_at(&mut ctx, &doc_uri(uri.as_str()), pos).is_some());
+    let mut ctx = handlers::QueryCtx::new(&snapshot, &sources, Encoding::Utf16);
+    let symbols = handlers::document_symbols(&mut ctx, &doc_uri(uri.as_str()));
     assert!(symbols.iter().any(|symbol| symbol.name == "extra"));
     drop(req_tx);
     worker.join().unwrap();
