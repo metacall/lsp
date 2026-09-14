@@ -31,7 +31,7 @@ pub(crate) fn capabilities(encoding: Encoding) -> ServerCapabilities {
         text_document_sync: Some(TextDocumentSyncCapability::Options(
             TextDocumentSyncOptions {
                 open_close: Some(true),
-                change: Some(TextDocumentSyncKind::FULL),
+                change: Some(TextDocumentSyncKind::INCREMENTAL),
                 save: Some(TextDocumentSyncSaveOptions::SaveOptions(SaveOptions {
                     include_text: Some(false),
                 })),
@@ -279,6 +279,15 @@ mod tests {
             ..Default::default()
         });
         assert!(supports_pull_diagnostics(&caps));
+    }
+
+    #[test]
+    fn capabilities_advertise_incremental_sync() {
+        let caps = capabilities(Encoding::Utf16);
+        let Some(TextDocumentSyncCapability::Options(options)) = caps.text_document_sync else {
+            panic!("sync must be advertised as options");
+        };
+        assert_eq!(options.change, Some(TextDocumentSyncKind::INCREMENTAL));
     }
 
     #[test]
