@@ -8,7 +8,7 @@ use crossbeam_channel::Sender;
 use lsp_server::Connection;
 
 use crate::buffers::BufferStore;
-use crate::error::ServerError;
+use crate::error::{ReindexError, ServerError};
 use crate::index::{IndexSnapshot, SourceText};
 use crate::position::Encoding;
 use crate::reindex::{ReindexReq, ReindexResp};
@@ -149,7 +149,14 @@ impl Session {
                 self.index = IndexState::Ready(snapshot);
             }
             Err(error) => {
-                tracing::warn!(%error, "reindex failed; index unavailable");
+                match &error {
+                    ReindexError::Engine(source) => {
+                        tracing::warn!(%source, "engine reanalysis failed; index unavailable")
+                    }
+                    ReindexError::Exhausted => {
+                        tracing::error!("snapshot counter exhausted; index unavailable")
+                    }
+                }
                 self.index = IndexState::Unavailable {
                     reason: error.to_string(),
                 };
@@ -302,7 +309,7 @@ mod tests {
             ReindexResp {
                 seq: 2,
                 elapsed_ms: 4,
-                result: Err(anyhow::anyhow!("failed reindex")),
+                result: Err(ReindexError::Exhausted),
             },
         );
 
@@ -322,7 +329,7 @@ mod tests {
             ReindexResp {
                 seq: 3,
                 elapsed_ms: 1,
-                result: Err(anyhow::anyhow!("stale")),
+                result: Err(ReindexError::Exhausted),
             },
         );
 

@@ -1,6 +1,17 @@
 //! Typed server errors.
 use lsp_server::{RequestId, Response, ResponseError};
 
+/// Failure of one reindex pass.
+#[derive(Debug, thiserror::Error)]
+pub enum ReindexError {
+    /// The engine refused the pass: discovery, extraction or resolution failed.
+    #[error("engine reanalysis failed: {0}")]
+    Engine(#[source] meta_ast::Error),
+    /// The snapshot id space is exhausted; the pass cannot be recorded.
+    #[error("snapshot counter exhausted")]
+    Exhausted,
+}
+
 const METHOD_NOT_FOUND: i32 = -32601;
 const INVALID_PARAMS: i32 = -32602;
 const INTERNAL_ERROR: i32 = -32603;

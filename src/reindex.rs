@@ -5,6 +5,7 @@ use std::time::Instant;
 use crossbeam_channel::{Receiver, Sender};
 use meta_ast::Overlay;
 
+use crate::error::ReindexError;
 use crate::index::{IndexSnapshot, Reindexer};
 use std::sync::Arc;
 
@@ -17,7 +18,7 @@ pub struct ReindexReq {
 pub struct ReindexResp {
     pub seq: u64,
     pub elapsed_ms: u128,
-    pub result: anyhow::Result<Arc<IndexSnapshot>>,
+    pub result: Result<Arc<IndexSnapshot>, ReindexError>,
 }
 
 pub fn spawn_worker(

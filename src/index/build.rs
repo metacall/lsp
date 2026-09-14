@@ -4,12 +4,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use meta_ast::model::{SnapshotId, SymbolId};
-use meta_ast::{
-    FileExtraction, Fingerprint, GraphAnalysis, Overlay, WatchState, reanalyze_extractions,
-};
+use meta_ast::{FileExtraction, Fingerprint, GraphAnalysis, Overlay, WatchState, reanalyze_extractions};
 
 use super::{IndexSnapshot, Occurrence};
 use crate::buffers::BufferStore;
+use crate::error::ReindexError;
 use crate::shards;
 use crate::types::DocVersion;
 
@@ -54,9 +53,10 @@ impl Reindexer {
         &mut self,
         root: &Path,
         overlays: &[Overlay],
-    ) -> anyhow::Result<Arc<IndexSnapshot>> {
+    ) -> Result<Arc<IndexSnapshot>, ReindexError> {
         let (extractions, change, diagnostics) =
-            reanalyze_extractions(root, None, overlays, &mut self.state)?;
+            reanalyze_extractions(root, None, overlays, &mut self.state)
+                .map_err(ReindexError::Engine)?;
         let versions = overlay_versions(overlays);
         let no_file_changed =
             change.files_added + change.files_modified + change.files_removed == 0;
@@ -99,7 +99,7 @@ impl Default for Reindexer {
 pub fn rebuild_from_inputs(
     root: &Path,
     overlays: &[Overlay],
-) -> anyhow::Result<Arc<IndexSnapshot>> {
+) -> Result<Arc<IndexSnapshot>, ReindexError> {
     Reindexer::new().rebuild(root, overlays)
 }
 
@@ -129,10 +129,10 @@ fn finish_snapshot(
     mut diagnostics: Vec<meta_ast::Diagnostic>,
     state: &WatchState,
     versions: HashMap<PathBuf, DocVersion>,
-) -> anyhow::Result<IndexSnapshot> {
+) -> Result<IndexSnapshot, ReindexError> {
     let raw = if snapshot_raw == 0 { 1 } else { snapshot_raw };
     let Some(id) = SnapshotId::new(raw) else {
-        anyhow::bail!("snapshot counter exhausted");
+        return Err(ReindexError::Exhausted);
     };
     // One engine pass gives the graph, the SCC, the scope cache and the records.
     let (analysis, mut graph_diagnostics) =
@@ -216,14 +216,6 @@ fn finish_snapshot(
     Ok(snapshot)
 }
 
-/// Buffer version of every overlay: the version the diagnostics describe.
-fn overlay_versions(overlays: &[Overlay]) -> HashMap<PathBuf, DocVersion> {
-    overlays
-        .iter()
-        .map(|overlay| (overlay.path.clone(), DocVersion::from(overlay.version)))
-        .collect()
-}
-
 fn content_hashes(state: &WatchState) -> HashMap<PathBuf, Fingerprint> {
     state
         .cache()
@@ -234,6 +226,14 @@ fn content_hashes(state: &WatchState) -> HashMap<PathBuf, Fingerprint> {
                 .fingerprint_of(path)
                 .map(|fp| (path.clone(), fp))
         })
+        .collect()
+}
+
+/// Buffer version of every overlay: the version the diagnostics describe.
+fn overlay_versions(overlays: &[Overlay]) -> HashMap<PathBuf, DocVersion> {
+    overlays
+        .iter()
+        .map(|overlay| (overlay.path.clone(), DocVersion::from(overlay.version)))
         .collect()
 }
 
@@ -328,7 +328,6 @@ mod tests {
         let first = reindexer.rebuild(dir.path(), &[]).unwrap();
         assert_eq!(first.document_version(&file), None);
 
-        // The text is unchanged; the version map still differs, so the snapshot is rebuilt.
         let versioned = reindexer
             .rebuild(dir.path(), std::slice::from_ref(&overlay))
             .unwrap();
