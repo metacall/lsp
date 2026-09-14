@@ -3,8 +3,11 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use meta_ast::model::{SnapshotId, SymbolId};
-use meta_ast::{FileExtraction, Fingerprint, GraphAnalysis, Overlay, WatchState, reanalyze_extractions};
+use meta_ast::model::{FileId, SnapshotId, SymbolId};
+use meta_ast::{
+    CodeGraph, FileExtraction, Fingerprint, GraphAnalysis, Overlay, WatchState,
+    reanalyze_extractions,
+};
 
 use super::{IndexSnapshot, Occurrence};
 use crate::buffers::BufferStore;
@@ -164,37 +167,9 @@ fn finish_snapshot(
         .resolved
     };
 
-    let mut by_path = HashMap::with_capacity(extractions.len());
-    let mut symbols = HashMap::new();
-    for (file_index, file) in extractions.iter().enumerate() {
-        by_path.insert(file.path.clone(), file_index);
-        for (symbol_index, symbol) in file.symbols.iter().enumerate() {
-            symbols.insert(symbol.id, (file_index, symbol_index));
-        }
-    }
-
-    let mut refs_out: HashMap<SymbolId, Vec<(SymbolId, f32)>> = HashMap::new();
-    for (source_id, target_id, confidence) in graph.reference_edges() {
-        refs_out
-            .entry(source_id)
-            .or_default()
-            .push((target_id, confidence));
-    }
-
-    let mut records_by_ref: HashMap<(PathBuf, usize), Vec<(SymbolId, f32)>> = HashMap::new();
-    for record in &references {
-        let targets = records_by_ref
-            .entry((record.file_path.clone(), record.range.byte_start))
-            .or_default();
-        if !targets.iter().any(|(id, _)| *id == record.target) {
-            targets.push((record.target, record.confidence));
-        }
-    }
-
-    let mut file_ids = HashMap::with_capacity(extractions.len());
-    for (file_id, file) in graph.files() {
-        file_ids.insert(file.path.clone(), file_id);
-    }
+    // Derived key views over one pass: path lookups go through `by_path`, every
+    // other map keys on the extraction index so paths are stored once.
+    let maps = DerivedMaps::new(&extractions, &graph, &references, state);
 
     let mut snapshot = IndexSnapshot {
         extractions,
@@ -203,30 +178,88 @@ fn finish_snapshot(
         references,
         client_calls,
         diagnostics,
-        by_path,
-        file_ids,
-        symbols,
-        refs_out,
-        records_by_ref,
+        by_path: maps.by_path,
+        file_ids: maps.file_ids,
+        symbols: maps.symbols,
+        refs_out: maps.refs_out,
+        records_by_ref: maps.records_by_ref,
         occurrences: HashMap::new(),
-        content_hashes: content_hashes(state),
+        content_hashes: maps.content_hashes,
         versions,
     };
     fill_occurrences(&mut snapshot);
     Ok(snapshot)
 }
 
-fn content_hashes(state: &WatchState) -> HashMap<PathBuf, Fingerprint> {
-    state
-        .cache()
-        .paths()
-        .filter_map(|path| {
-            state
-                .cache()
-                .fingerprint_of(path)
-                .map(|fp| (path.clone(), fp))
-        })
-        .collect()
+/// Index views derived from one analysis pass. All maps key on the extraction
+/// index; `by_path` is the only path-keyed map and owns the path-to-index seam.
+struct DerivedMaps {
+    by_path: HashMap<PathBuf, usize>,
+    file_ids: Vec<Option<FileId>>,
+    symbols: HashMap<SymbolId, (usize, usize)>,
+    refs_out: HashMap<SymbolId, Vec<(SymbolId, f32)>>,
+    records_by_ref: HashMap<(usize, usize), Vec<(SymbolId, f32)>>,
+    content_hashes: Vec<Option<Fingerprint>>,
+}
+
+impl DerivedMaps {
+    fn new(
+        extractions: &[Arc<FileExtraction>],
+        graph: &CodeGraph,
+        references: &[meta_ast::ResolvedReference],
+        state: &WatchState,
+    ) -> Self {
+        let mut by_path = HashMap::with_capacity(extractions.len());
+        let mut symbols = HashMap::new();
+        for (file_index, file) in extractions.iter().enumerate() {
+            by_path.insert(file.path.clone(), file_index);
+            for (symbol_index, symbol) in file.symbols.iter().enumerate() {
+                symbols.insert(symbol.id, (file_index, symbol_index));
+            }
+        }
+
+        let mut file_ids = vec![None; extractions.len()];
+        for (file_id, file) in graph.files() {
+            if let Some(&index) = by_path.get(&file.path) {
+                file_ids[index] = Some(file_id);
+            }
+        }
+
+        let mut refs_out: HashMap<SymbolId, Vec<(SymbolId, f32)>> = HashMap::new();
+        for (source_id, target_id, confidence) in graph.reference_edges() {
+            refs_out
+                .entry(source_id)
+                .or_default()
+                .push((target_id, confidence));
+        }
+
+        let mut records_by_ref: HashMap<(usize, usize), Vec<(SymbolId, f32)>> = HashMap::new();
+        for record in references {
+            let Some(&file_index) = by_path.get(&record.file_path) else {
+                continue;
+            };
+            let targets = records_by_ref
+                .entry((file_index, record.range.byte_start))
+                .or_default();
+            if !targets.iter().any(|(id, _)| *id == record.target) {
+                targets.push((record.target, record.confidence));
+            }
+        }
+
+        let mut content_hashes = vec![None; extractions.len()];
+        for (index, file) in extractions.iter().enumerate() {
+            content_hashes[index] = state.cache().fingerprint_of(&file.path);
+        }
+
+        Self {
+            by_path,
+            file_ids,
+            symbols,
+            refs_out,
+            records_by_ref,
+            content_hashes,
+        }
+    }
 }
 
 /// Buffer version of every overlay: the version the diagnostics describe.
@@ -242,28 +275,31 @@ fn fill_occurrences(snapshot: &mut IndexSnapshot) {
     use super::query::{client_call_targets, reference_targets};
 
     let mut occurrences: HashMap<SymbolId, Vec<Occurrence>> = HashMap::new();
-    for file in &snapshot.extractions {
+    for (file_index, file) in snapshot.extractions.iter().enumerate() {
         for reference in &file.references {
-            for (id, _) in reference_targets(snapshot, file, reference) {
+            for (id, _) in reference_targets(snapshot, file_index, reference) {
                 occurrences.entry(id).or_default().push(Occurrence {
-                    path: file.path.clone(),
+                    file: file_index,
                     range: reference.range.clone(),
                 });
             }
         }
     }
     // One call site expands once through the helper: per-record expansion is the count squared.
-    let mut visited: HashSet<(PathBuf, usize)> = HashSet::new();
+    let mut visited: HashSet<(usize, usize)> = HashSet::new();
     for call in &snapshot.client_calls {
         let Some(range) = call.source_range.clone() else {
             continue;
         };
-        if !visited.insert((call.source_file.clone(), range.byte_start)) {
+        let Some(file_index) = snapshot.file_index(&call.source_file) else {
+            continue;
+        };
+        if !visited.insert((file_index, range.byte_start)) {
             continue;
         }
-        for (id, _) in client_call_targets(snapshot, &call.source_file, &range) {
+        for (id, _) in client_call_targets(snapshot, file_index, &range) {
             occurrences.entry(id).or_default().push(Occurrence {
-                path: call.source_file.clone(),
+                file: file_index,
                 range: range.clone(),
             });
         }

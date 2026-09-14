@@ -1,6 +1,5 @@
 //! Cursor resolution over the snapshot.
 use std::cmp::Ordering;
-use std::path::Path;
 
 use meta_ast::FileExtraction;
 use meta_ast::model::{SourceRange, SymbolId};
@@ -113,22 +112,25 @@ fn dedup_targets(snapshot: &IndexSnapshot, targets: Vec<(SymbolId, f32)>) -> Vec
 /// Targets of one reference: engine records for its byte, else the scope cache.
 pub(super) fn reference_targets(
     snapshot: &IndexSnapshot,
-    file: &FileExtraction,
+    file_index: usize,
     reference: &meta_ast::UnresolvedReference,
 ) -> Vec<(SymbolId, f32)> {
-    let recorded = snapshot.recorded_targets(&file.path, reference.range.byte_start);
+    let recorded = snapshot.recorded_targets(file_index, reference.range.byte_start);
     if !recorded.is_empty() {
         return dedup_targets(snapshot, recorded.to_vec());
     }
-    scoped_targets(snapshot, file, &reference.name)
+    scoped_targets(snapshot, file_index, &reference.name)
 }
 
 /// Targets of one client call site; a resolved call always carries a record.
 pub(super) fn client_call_targets(
     snapshot: &IndexSnapshot,
-    path: &Path,
+    file_index: usize,
     range: &SourceRange,
 ) -> Vec<(SymbolId, f32)> {
+    let Some(path) = snapshot.path_of(file_index) else {
+        return Vec::new();
+    };
     let targets: Vec<(SymbolId, f32)> = snapshot
         .client_calls_at(path, range)
         .map(|call| (call.target, call.confidence))
@@ -136,13 +138,9 @@ pub(super) fn client_call_targets(
     dedup_targets(snapshot, targets)
 }
 
-fn scoped_targets(
-    snapshot: &IndexSnapshot,
-    file: &FileExtraction,
-    name: &str,
-) -> Vec<(SymbolId, f32)> {
+fn scoped_targets(snapshot: &IndexSnapshot, file_index: usize, name: &str) -> Vec<(SymbolId, f32)> {
     let scoped: Vec<(SymbolId, f32)> = snapshot
-        .file_id(&file.path)
+        .file_id_at(file_index)
         .and_then(|file_id| snapshot.scope.resolve(file_id, name))
         .map(<[(SymbolId, f32)]>::to_vec)
         .unwrap_or_default();
@@ -155,12 +153,16 @@ pub fn resolve_targets<'a>(
     uri: &DocUri,
     byte: usize,
 ) -> Vec<(SymbolId, Option<&'a SourceRange>)> {
-    let Some(file) = file_for_uri(snapshot, uri) else {
+    let Some(path) = uri.to_path() else {
         return Vec::new();
     };
+    let Some(file_index) = snapshot.file_index(&path) else {
+        return Vec::new();
+    };
+    let file = &snapshot.extractions[file_index];
 
     if let Some(range) = call_site_at(file, byte).and_then(|site| site.source_range.as_ref()) {
-        let ordered = client_call_targets(snapshot, &file.path, range);
+        let ordered = client_call_targets(snapshot, file_index, range);
         if !ordered.is_empty() {
             return ordered
                 .into_iter()
@@ -170,7 +172,7 @@ pub fn resolve_targets<'a>(
     }
 
     if let Some(reference) = reference_at(file, byte) {
-        return reference_targets(snapshot, file, reference)
+        return reference_targets(snapshot, file_index, reference)
             .into_iter()
             .map(|(id, _)| (id, Some(&reference.range)))
             .collect();
@@ -188,9 +190,7 @@ mod tests {
     use crate::convert;
     use crate::index::rebuild_from_inputs;
 
-    fn doc_uri(value: &str) -> DocUri {
-        DocUri::try_from(value).expect("document URI")
-    }
+    use crate::testutil::doc_uri;
 
     #[test]
     fn unresolved_reference_does_not_fall_back_to_caller() {
@@ -280,7 +280,7 @@ mod tests {
 
         assert!(
             !snapshot
-                .recorded_targets(&b, reference.range.byte_start)
+                .recorded_targets(snapshot.file_index(&b).unwrap(), reference.range.byte_start)
                 .is_empty(),
             "a reference inside a symbol has a record"
         );
@@ -310,7 +310,7 @@ mod tests {
 
         assert!(
             snapshot
-                .recorded_targets(&b, reference.range.byte_start)
+                .recorded_targets(snapshot.file_index(&b).unwrap(), reference.range.byte_start)
                 .is_empty(),
             "the engine keeps no record without a source symbol"
         );

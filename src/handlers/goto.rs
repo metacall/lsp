@@ -99,15 +99,18 @@ pub fn references_at(
             });
         }
         for occurrence in ctx.snapshot().occurrences_of(id) {
-            let Some(owner_uri) = convert::path_to_uri(&occurrence.path) else {
+            let Some(path) = ctx.snapshot().path_of(occurrence.file) else {
+                continue;
+            };
+            let Some(owner_uri) = convert::path_to_uri(path) else {
                 continue;
             };
             let location = Location {
                 uri: owner_uri,
-                range: ctx.range_for(&occurrence.path, &occurrence.range),
+                range: ctx.range_for(path, &occurrence.range),
             };
             sites.push(ReferenceSite {
-                path: occurrence.path.clone(),
+                path: path.to_path_buf(),
                 byte: occurrence.range.byte_start,
                 location,
             });
