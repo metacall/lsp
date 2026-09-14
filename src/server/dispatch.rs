@@ -43,12 +43,32 @@ pub(crate) fn handle_request(
     let outcome = if registration.is_cancelled() {
         Err(ServerError::Cancelled)
     } else {
-        dispatch_request(session, &method, params)
+        catch_internal(|| dispatch_request(session, &method, params))
     };
     drop(registration);
     match outcome {
         Ok(value) => respond(connection, id, value),
         Err(error) => send_response_error(connection, id, &error),
+    }
+}
+
+/// Run one handler; a panic becomes an internal error response, not a dead loop.
+fn catch_internal(
+    handle: impl FnOnce() -> Result<serde_json::Value, ServerError>,
+) -> Result<serde_json::Value, ServerError> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(handle)) {
+        Ok(outcome) => outcome,
+        Err(payload) => {
+            let message = payload
+                .downcast_ref::<&str>()
+                .map(|message| (*message).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic payload".to_string());
+            tracing::error!(%message, "request handler panicked");
+            Err(ServerError::Internal(format!(
+                "request handler panicked: {message}"
+            )))
+        }
     }
 }
 
@@ -186,7 +206,6 @@ pub(crate) fn send_response_error(connection: &Connection, id: RequestId, error:
     send(connection, Message::Response(error.to_response(id)));
 }
 
-/// Parse the document URI of one notification; an unparsable URI is logged and dropped.
 fn document_uri(method: &str, uri: &lsp_types::Uri) -> Option<DocUri> {
     match DocUri::try_from(uri) {
         Ok(uri) => Some(uri),
@@ -908,6 +927,24 @@ mod tests {
 
         let req = req_rx.try_recv().expect("the batch sends one request");
         assert_eq!(req.overlays[0].text, "def two(): pass\n");
+    }
+
+    #[test]
+    fn a_handler_panic_becomes_an_internal_error() {
+        let outcome = catch_internal(|| panic!("boom"));
+        let Err(ServerError::Internal(message)) = outcome else {
+            panic!("a panic must map to an internal error, got {outcome:?}");
+        };
+        assert!(
+            message.contains("boom"),
+            "the panic message is kept: {message}"
+        );
+    }
+
+    #[test]
+    fn catch_internal_passes_the_result_through() {
+        let outcome = catch_internal(|| Ok(serde_json::json!(1)));
+        assert_eq!(outcome.unwrap(), serde_json::json!(1));
     }
 
     #[test]
