@@ -42,3 +42,11 @@ harness = false
 [profile.release]
 strip = "symbols"
 lto = "thin"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+redundant_clone = "warn"
+needless_collect = "warn"
