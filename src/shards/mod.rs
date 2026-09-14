@@ -55,9 +55,12 @@ pub fn save(
         if overlays.contains(&file.path) || !file.path.starts_with(root) {
             continue;
         }
-        kept_paths.insert(file.path.clone());
+        // Manifest and payload paths are stored relative to the root, so the
+        // cache stays portable across machines and mounts.
+        let stored = file.path.strip_prefix(root).unwrap_or(file.path.as_path());
+        kept_paths.insert(stored.to_path_buf());
         let indexed = snapshot.content_hash(&file.path);
-        let Some(record) = manifest_record(file, indexed, &previous, &mut touched) else {
+        let Some(record) = manifest_record(stored, file, indexed, &previous, &mut touched) else {
             continue;
         };
         by_bucket
@@ -85,7 +88,11 @@ pub fn save(
             let file = &snapshot.extractions[index];
             match ShardFile::from_extraction(file, &snapshot.graph) {
                 Ok(mut shard_file) => {
-                    shard_file.path = file.path.clone();
+                    shard_file.path = file
+                        .path
+                        .strip_prefix(root)
+                        .unwrap_or(file.path.as_path())
+                        .to_path_buf();
                     shard_files.push(shard_file);
                 }
                 Err(error) => {
@@ -113,13 +120,14 @@ pub fn save(
 
 /// The record hash describes the content the payload came from, so a concurrent edit cannot validate a stale payload.
 fn manifest_record(
+    stored: &Path,
     file: &meta_ast::FileExtraction,
     indexed: Option<Fingerprint>,
     previous: &HashMap<PathBuf, ShardManifestRecord>,
     touched: &mut HashSet<String>,
 ) -> Option<ShardManifestRecord> {
     let indexed = indexed?;
-    let reused = previous.get(&file.path).and_then(|prev| {
+    let reused = previous.get(stored).and_then(|prev| {
         (prev.content_hash == hex(indexed.as_bytes())
             && prev.shard == bucket_for(&prev.content_hash))
         .then(|| prev.clone())
@@ -131,13 +139,13 @@ fn manifest_record(
     let hash = hex(indexed.as_bytes());
     let shard = bucket_for(&hash);
     touched.insert(shard.clone());
-    if let Some(prev) = previous.get(&file.path)
+    if let Some(prev) = previous.get(stored)
         && prev.shard != shard
     {
         touched.insert(prev.shard.clone());
     }
     Some(ShardManifestRecord::new(
-        file.path.clone(),
+        stored.to_path_buf(),
         hash,
         fs::metadata(&file.path).ok()?.len(),
         mtime_seconds(&file.path),
@@ -226,9 +234,13 @@ fn seed_cache(root: &Path, watch: &mut WatchState, extractions: Vec<Arc<FileExtr
             );
             continue;
         }
+        // The payload carries a root-relative path; the cache is keyed and read
+        // by absolute paths everywhere else, so normalize before seeding.
+        let mut extraction = (*extraction).clone();
+        extraction.path = absolute.clone();
         watch
             .cache_mut()
-            .update(absolute, Fingerprint::of(&bytes), extraction);
+            .update(absolute, Fingerprint::of(&bytes), Arc::new(extraction));
         seeded += 1;
     }
     seeded
