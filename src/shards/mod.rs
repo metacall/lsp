@@ -57,7 +57,7 @@ pub fn save(
         }
         // Manifest and payload paths are stored relative to the root, so the
         // cache stays portable across machines and mounts.
-        let stored = file.path.strip_prefix(root).unwrap_or(file.path.as_path());
+        let stored = relative(root, &file.path);
         kept_paths.insert(stored.to_path_buf());
         let indexed = snapshot.content_hash(&file.path);
         let Some(record) = manifest_record(stored, file, indexed, &previous, &mut touched) else {
@@ -88,11 +88,7 @@ pub fn save(
             let file = &snapshot.extractions[index];
             match ShardFile::from_extraction(file, &snapshot.graph) {
                 Ok(mut shard_file) => {
-                    shard_file.path = file
-                        .path
-                        .strip_prefix(root)
-                        .unwrap_or(file.path.as_path())
-                        .to_path_buf();
+                    shard_file.path = relative(root, &file.path).to_path_buf();
                     shard_files.push(shard_file);
                 }
                 Err(error) => {
@@ -116,6 +112,11 @@ pub fn save(
     write_atomic(&dir.join(HEADER_FILE), &header)?;
     prune(&dir.join("shards"), &referenced);
     Ok(())
+}
+
+/// Root-relative spelling of one indexed path; every path reaching a record is under the root.
+fn relative<'a>(root: &Path, path: &'a Path) -> &'a Path {
+    path.strip_prefix(root).unwrap_or(path)
 }
 
 /// The record hash describes the content the payload came from, so a concurrent edit cannot validate a stale payload.
