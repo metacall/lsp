@@ -47,8 +47,14 @@ pub(crate) fn handle_request(
     };
     drop(registration);
     match outcome {
-        Ok(value) => respond(connection, id, value),
-        Err(error) => send_response_error(connection, id, &error),
+        Ok(value) => send(
+            connection,
+            Message::Response(Response {
+                id,
+                response_result: Ok(value),
+            }),
+        ),
+        Err(error) => send(connection, Message::Response(error.to_response(id))),
     }
 }
 
@@ -195,20 +201,6 @@ fn send(connection: &Connection, message: Message) {
     if let Err(error) = connection.sender.send(message) {
         tracing::warn!(%error, "send failed");
     }
-}
-
-fn respond(connection: &Connection, id: RequestId, value: serde_json::Value) {
-    send(
-        connection,
-        Message::Response(Response {
-            id,
-            response_result: Ok(value),
-        }),
-    );
-}
-
-pub(crate) fn send_response_error(connection: &Connection, id: RequestId, error: &ServerError) {
-    send(connection, Message::Response(error.to_response(id)));
 }
 
 fn document_uri(method: &str, uri: &lsp_types::Uri) -> Option<DocUri> {
@@ -364,9 +356,6 @@ mod tests {
     use super::*;
     use crate::cancel::Cancellation;
     use crate::index;
-    use crate::position::Encoding;
-    use crate::reindex::ReindexReq;
-    use crate::server::session::Session;
 
     use crate::testutil::doc_uri;
 
@@ -399,14 +388,7 @@ mod tests {
         };
         let snapshot =
             index::rebuild_from_inputs(dir.path(), std::slice::from_ref(&overlay)).unwrap();
-        let (req_tx, _req_rx) = crossbeam_channel::unbounded::<ReindexReq>();
-        let mut session = Session::new(
-            crate::types::RootDir::try_from(dir.path()).expect("root"),
-            Encoding::Utf16,
-            snapshot,
-            req_tx,
-            false,
-        );
+        let (mut session, _req_rx) = crate::testutil::session_with(dir.path(), snapshot, false);
         let (server, _client) = Connection::memory();
         let cancel = Cancellation::default();
         handle_notification(
@@ -466,15 +448,7 @@ mod tests {
     #[test]
     fn did_open_unknown_language_skips_reindex() {
         let dir = tempfile::tempdir().unwrap();
-        let snapshot = index::rebuild_from_inputs(dir.path(), &[]).unwrap();
-        let (req_tx, req_rx) = crossbeam_channel::unbounded::<ReindexReq>();
-        let mut session = Session::new(
-            crate::types::RootDir::try_from(dir.path()).expect("root"),
-            Encoding::Utf16,
-            snapshot,
-            req_tx,
-            false,
-        );
+        let (mut session, req_rx) = crate::testutil::session(dir.path(), false);
         let (server, _client) = Connection::memory();
         let cancel = Cancellation::default();
 
@@ -492,15 +466,7 @@ mod tests {
     #[test]
     fn did_open_supported_language_requests_reindex() {
         let dir = tempfile::tempdir().unwrap();
-        let snapshot = index::rebuild_from_inputs(dir.path(), &[]).unwrap();
-        let (req_tx, req_rx) = crossbeam_channel::unbounded::<ReindexReq>();
-        let mut session = Session::new(
-            crate::types::RootDir::try_from(dir.path()).expect("root"),
-            Encoding::Utf16,
-            snapshot,
-            req_tx,
-            false,
-        );
+        let (mut session, req_rx) = crate::testutil::session(dir.path(), false);
         let (server, _client) = Connection::memory();
         let cancel = Cancellation::default();
         let uri = crate::convert::path_to_uri(&dir.path().join("a.py"))
@@ -522,15 +488,7 @@ mod tests {
     #[test]
     fn did_close_drops_only_tracked_documents() {
         let dir = tempfile::tempdir().unwrap();
-        let snapshot = index::rebuild_from_inputs(dir.path(), &[]).unwrap();
-        let (req_tx, _req_rx) = crossbeam_channel::unbounded::<ReindexReq>();
-        let mut session = Session::new(
-            crate::types::RootDir::try_from(dir.path()).expect("root"),
-            Encoding::Utf16,
-            snapshot,
-            req_tx,
-            false,
-        );
+        let (mut session, _req_rx) = crate::testutil::session(dir.path(), false);
         let (server, _client) = Connection::memory();
         let cancel = Cancellation::default();
 
@@ -565,15 +523,7 @@ mod tests {
     fn watched_source_event_requests_a_pass() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.py"), "def greet(): pass\n").unwrap();
-        let snapshot = index::rebuild_from_inputs(dir.path(), &[]).unwrap();
-        let (req_tx, req_rx) = crossbeam_channel::unbounded::<ReindexReq>();
-        let mut session = Session::new(
-            crate::types::RootDir::try_from(dir.path()).expect("root"),
-            Encoding::Utf16,
-            snapshot,
-            req_tx,
-            false,
-        );
+        let (mut session, req_rx) = crate::testutil::session(dir.path(), false);
         let (server, _client) = Connection::memory();
         let cancel = Cancellation::default();
         let uri = crate::convert::path_to_uri(&dir.path().join("a.py"))
@@ -594,15 +544,7 @@ mod tests {
     fn watched_deletion_of_indexed_file_reindexes() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.py"), "def greet(): pass\n").unwrap();
-        let snapshot = index::rebuild_from_inputs(dir.path(), &[]).unwrap();
-        let (req_tx, req_rx) = crossbeam_channel::unbounded::<ReindexReq>();
-        let mut session = Session::new(
-            crate::types::RootDir::try_from(dir.path()).expect("root"),
-            Encoding::Utf16,
-            snapshot,
-            req_tx,
-            false,
-        );
+        let (mut session, req_rx) = crate::testutil::session(dir.path(), false);
         let (server, _client) = Connection::memory();
         let cancel = Cancellation::default();
         let uri = crate::convert::path_to_uri(&dir.path().join("a.py"))
@@ -622,15 +564,7 @@ mod tests {
     #[test]
     fn watched_change_outside_root_is_ignored() {
         let dir = tempfile::tempdir().unwrap();
-        let snapshot = index::rebuild_from_inputs(dir.path(), &[]).unwrap();
-        let (req_tx, req_rx) = crossbeam_channel::unbounded::<ReindexReq>();
-        let mut session = Session::new(
-            crate::types::RootDir::try_from(dir.path()).expect("root"),
-            Encoding::Utf16,
-            snapshot,
-            req_tx,
-            false,
-        );
+        let (mut session, req_rx) = crate::testutil::session(dir.path(), false);
         let (server, _client) = Connection::memory();
         let cancel = Cancellation::default();
 
@@ -647,15 +581,7 @@ mod tests {
     #[test]
     fn watched_change_for_unsupported_extension_is_ignored() {
         let dir = tempfile::tempdir().unwrap();
-        let snapshot = index::rebuild_from_inputs(dir.path(), &[]).unwrap();
-        let (req_tx, req_rx) = crossbeam_channel::unbounded::<ReindexReq>();
-        let mut session = Session::new(
-            crate::types::RootDir::try_from(dir.path()).expect("root"),
-            Encoding::Utf16,
-            snapshot,
-            req_tx,
-            false,
-        );
+        let (mut session, req_rx) = crate::testutil::session(dir.path(), false);
         let (server, _client) = Connection::memory();
         let cancel = Cancellation::default();
         let uri = crate::convert::path_to_uri(&dir.path().join("README.md")).unwrap();
@@ -668,15 +594,7 @@ mod tests {
     #[test]
     fn watched_resolver_change_warns_once() {
         let dir = tempfile::tempdir().unwrap();
-        let snapshot = index::rebuild_from_inputs(dir.path(), &[]).unwrap();
-        let (req_tx, req_rx) = crossbeam_channel::unbounded::<ReindexReq>();
-        let mut session = Session::new(
-            crate::types::RootDir::try_from(dir.path()).expect("root"),
-            Encoding::Utf16,
-            snapshot,
-            req_tx,
-            false,
-        );
+        let (mut session, req_rx) = crate::testutil::session(dir.path(), false);
         let (server, client) = Connection::memory();
         let cancel = Cancellation::default();
         let uri = crate::convert::path_to_uri(&dir.path().join("tsconfig.json")).unwrap();
@@ -734,15 +652,7 @@ mod tests {
     #[test]
     fn a_cancelled_in_flight_request_returns_request_cancelled() {
         let dir = tempfile::tempdir().unwrap();
-        let snapshot = index::rebuild_from_inputs(dir.path(), &[]).unwrap();
-        let (req_tx, _req_rx) = crossbeam_channel::unbounded::<ReindexReq>();
-        let session = Session::new(
-            crate::types::RootDir::try_from(dir.path()).expect("root"),
-            Encoding::Utf16,
-            snapshot,
-            req_tx,
-            false,
-        );
+        let (session, _req_rx) = crate::testutil::session(dir.path(), false);
         let (server, client) = Connection::memory();
         let cancel = Cancellation::default();
         let id = RequestId::from(2);
@@ -782,15 +692,7 @@ mod tests {
     fn a_cancel_for_an_unknown_id_leaves_no_state() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.py"), "def greet(): pass\n").unwrap();
-        let snapshot = index::rebuild_from_inputs(dir.path(), &[]).unwrap();
-        let (req_tx, _req_rx) = crossbeam_channel::unbounded::<ReindexReq>();
-        let mut session = Session::new(
-            crate::types::RootDir::try_from(dir.path()).expect("root"),
-            Encoding::Utf16,
-            snapshot,
-            req_tx,
-            false,
-        );
+        let (mut session, _req_rx) = crate::testutil::session(dir.path(), false);
         let (server, client) = Connection::memory();
         let cancel = Cancellation::default();
         let id = RequestId::from(77);
@@ -849,15 +751,7 @@ mod tests {
     #[test]
     fn did_save_with_changed_text_reindexes_now() {
         let dir = tempfile::tempdir().unwrap();
-        let snapshot = index::rebuild_from_inputs(dir.path(), &[]).unwrap();
-        let (req_tx, req_rx) = crossbeam_channel::unbounded::<ReindexReq>();
-        let mut session = Session::new(
-            crate::types::RootDir::try_from(dir.path()).expect("root"),
-            Encoding::Utf16,
-            snapshot,
-            req_tx,
-            false,
-        );
+        let (mut session, req_rx) = crate::testutil::session(dir.path(), false);
         let (server, _client) = Connection::memory();
         let cancel = Cancellation::default();
         let uri = crate::convert::path_to_uri(&dir.path().join("a.py"))
@@ -888,15 +782,7 @@ mod tests {
     #[test]
     fn did_save_carries_the_newest_buffer_into_the_batch() {
         let dir = tempfile::tempdir().unwrap();
-        let snapshot = index::rebuild_from_inputs(dir.path(), &[]).unwrap();
-        let (req_tx, req_rx) = crossbeam_channel::unbounded::<ReindexReq>();
-        let mut session = Session::new(
-            crate::types::RootDir::try_from(dir.path()).expect("root"),
-            Encoding::Utf16,
-            snapshot,
-            req_tx,
-            false,
-        );
+        let (mut session, req_rx) = crate::testutil::session(dir.path(), false);
         let (server, _client) = Connection::memory();
         let cancel = Cancellation::default();
         let uri = crate::convert::path_to_uri(&dir.path().join("a.py"))
@@ -955,15 +841,7 @@ mod tests {
     #[test]
     fn unknown_method_returns_method_not_found() {
         let dir = tempfile::tempdir().unwrap();
-        let snapshot = index::rebuild_from_inputs(dir.path(), &[]).unwrap();
-        let (req_tx, _req_rx) = crossbeam_channel::unbounded::<ReindexReq>();
-        let session = Session::new(
-            crate::types::RootDir::try_from(dir.path()).expect("root"),
-            Encoding::Utf16,
-            snapshot,
-            req_tx,
-            false,
-        );
+        let (session, _req_rx) = crate::testutil::session(dir.path(), false);
         let (server, client) = Connection::memory();
         let cancel = Cancellation::default();
 

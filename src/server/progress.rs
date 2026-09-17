@@ -11,14 +11,18 @@ use lsp_types::{
 };
 
 /// Work-done progress, one operation at a time.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Progress {
-    #[default]
     Idle,
     /// Create request sent, waiting for the client ack.
-    Launching { ack: RequestId, seq: u64 },
+    Launching {
+        ack: RequestId,
+        seq: u64,
+    },
     /// Client acked; the End notification is still owed.
-    Active { seq: u64 },
+    Active {
+        seq: u64,
+    },
 }
 
 pub(crate) struct ProgressTracker {

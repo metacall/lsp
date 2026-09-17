@@ -46,7 +46,7 @@ impl TryFrom<&lsp_types::Uri> for DocUri {
 }
 
 /// Document version the client sent; the buffer store keeps it strictly increasing.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DocVersion(i32);
 
 impl DocVersion {

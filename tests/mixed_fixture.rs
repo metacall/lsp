@@ -1,12 +1,14 @@
 //! Cross-language fixture: a TypeScript caller resolving a Python declaration.
-use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 use lsp_types::Position;
 use meta_call_lsp::handlers::{self, QueryCtx};
-use meta_call_lsp::index::{self, IndexSnapshot, SourceText};
+use meta_call_lsp::index::{self, IndexSnapshot};
 use meta_call_lsp::position::{Encoding, LineIndex};
-use meta_call_lsp::types::DocUri;
+
+mod common;
+
+use common::{DiskSources, uri_of};
 
 const MIXED: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/mixed");
 const PY: &str = "pricing.py";
@@ -14,19 +16,6 @@ const TS: &str = "caller.ts";
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(MIXED).join(name)
-}
-
-fn doc_uri(path: &Path) -> DocUri {
-    let uri = meta_call_lsp::convert::path_to_uri(path).expect("uri");
-    DocUri::try_from(uri.as_str()).expect("document URI")
-}
-
-struct DiskSources;
-
-impl SourceText for DiskSources {
-    fn source(&self, path: &Path) -> Option<Cow<'_, str>> {
-        std::fs::read_to_string(path).ok().map(Cow::Owned)
-    }
 }
 
 fn snapshot() -> std::sync::Arc<IndexSnapshot> {
@@ -84,7 +73,7 @@ fn the_cross_language_call_resolves_to_the_python_declaration() {
 fn definition_from_the_typescript_call_reaches_the_python_declaration() {
     let snapshot = snapshot();
     let sources = DiskSources;
-    let uri = doc_uri(&fixture(TS));
+    let uri = uri_of(&fixture(TS));
     let position = position_in(TS, "multiply", 3);
 
     let locations = match handlers::definition_at(
@@ -98,7 +87,7 @@ fn definition_from_the_typescript_call_reaches_the_python_declaration() {
     };
 
     assert_eq!(locations.len(), 1);
-    assert_eq!(locations[0].uri.as_str(), doc_uri(&fixture(PY)).as_str());
+    assert_eq!(locations[0].uri.as_str(), uri_of(&fixture(PY)).as_str());
     let declaration_line = std::fs::read_to_string(fixture(PY))
         .expect("fixture text")
         .lines()
@@ -111,7 +100,7 @@ fn definition_from_the_typescript_call_reaches_the_python_declaration() {
 fn references_from_the_python_declaration_include_the_typescript_call() {
     let snapshot = snapshot();
     let sources = DiskSources;
-    let uri = doc_uri(&fixture(PY));
+    let uri = uri_of(&fixture(PY));
     let position = position_in(PY, "multiply", 3);
 
     let references = handlers::references_at(
@@ -127,14 +116,14 @@ fn references_from_the_python_declaration_include_the_typescript_call() {
         .collect();
     uris.sort();
     uris.dedup();
-    let mut expected = [doc_uri(&fixture(PY)), doc_uri(&fixture(TS))];
+    let mut expected = [uri_of(&fixture(PY)), uri_of(&fixture(TS))];
     expected.sort_by(|a, b| a.as_str().cmp(b.as_str()));
     assert_eq!(
         uris,
         expected.iter().map(|uri| uri.as_str()).collect::<Vec<_>>(),
         "the declaration with its local use, and the TypeScript call site"
     );
-    assert_eq!(references[0].uri.as_str(), doc_uri(&fixture(PY)).as_str());
+    assert_eq!(references[0].uri.as_str(), uri_of(&fixture(PY)).as_str());
     assert_eq!(
         references.len(),
         4,
@@ -158,7 +147,7 @@ fn workspace_symbol_finds_the_python_declaration() {
 fn completion_at_the_call_site_offers_the_python_symbol() {
     let snapshot = snapshot();
     let sources = DiskSources;
-    let uri = doc_uri(&fixture(TS));
+    let uri = uri_of(&fixture(TS));
     let position = position_in(TS, "multiply", 2);
 
     let items = handlers::completion_at(
@@ -193,14 +182,6 @@ fn the_fold_keeps_one_entry_per_target_and_the_highest_confidence() {
     assert_eq!(call.target, multiply);
     assert_eq!(call.confidence, 0.6, "a unique global call");
 
-    let recorded: Vec<f32> = snapshot
-        .references
-        .iter()
-        .filter(|record| record.target == multiply && record.source == total)
-        .map(|record| record.confidence)
-        .collect();
-    assert_eq!(recorded, vec![1.0], "the local call resolves at 1.0");
-
     let folded = targets_of(&snapshot, total);
     assert!(
         folded.contains(&(multiply, 1.0)),
@@ -232,7 +213,7 @@ fn the_fold_keeps_one_entry_per_target_and_the_highest_confidence() {
 fn hover_snapshot_for_the_python_symbol() {
     let snapshot = snapshot();
     let sources = DiskSources;
-    let uri = doc_uri(&fixture(PY));
+    let uri = uri_of(&fixture(PY));
     let position = position_in(PY, "multiply", 3);
 
     let hover = handlers::hover_at(
@@ -249,7 +230,7 @@ fn hover_snapshot_for_the_python_symbol() {
 fn completion_ranking_snapshot_at_the_call_site() {
     let snapshot = snapshot();
     let sources = DiskSources;
-    let uri = doc_uri(&fixture(TS));
+    let uri = uri_of(&fixture(TS));
     let position = position_in(TS, "multiply", 2);
 
     let items = handlers::completion_at(

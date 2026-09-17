@@ -6,12 +6,12 @@ use std::sync::Arc;
 
 use meta_ast::deploy::client_call::ResolvedClientCall;
 use meta_ast::model::{FileId, SourceRange, SymbolId};
-use meta_ast::{CodeGraph, FileExtraction, Fingerprint, FlattenedScopeCache, ResolvedReference};
+use meta_ast::{CodeGraph, FileExtraction, Fingerprint, FlattenedScopeCache};
 
 use crate::types::DocVersion;
 
-pub mod build;
-pub mod query;
+mod build;
+mod query;
 
 pub use build::{Persistence, Reindexer, collect_inputs, rebuild_from_inputs};
 pub use query::{resolve_targets, symbol_at};
@@ -23,14 +23,13 @@ pub struct Occurrence {
     pub range: SourceRange,
 }
 
-/// Immutable query surface over one analysis pass. `references` holds one record
-/// per resolved use site; `client_calls` one per resolved metacall call site.
+/// Immutable query surface over one analysis pass. `client_calls` holds one record
+/// per resolved metacall call site; resolved use sites live in `records_by_ref`.
 /// Internal maps key on extraction index; `by_path` is the single path seam.
 pub struct IndexSnapshot {
     pub extractions: Vec<Arc<FileExtraction>>,
     pub graph: CodeGraph,
     pub scope: FlattenedScopeCache,
-    pub references: Vec<ResolvedReference>,
     pub client_calls: Vec<ResolvedClientCall>,
     pub diagnostics: Vec<meta_ast::Diagnostic>,
     by_path: HashMap<PathBuf, usize>,
@@ -113,10 +112,6 @@ impl IndexSnapshot {
 
     pub fn content_hash(&self, path: &Path) -> Option<Fingerprint> {
         let index = self.file_index(path)?;
-        self.content_hash_at(index)
-    }
-
-    pub(crate) fn content_hash_at(&self, index: usize) -> Option<Fingerprint> {
         self.content_hashes.get(index).copied().flatten()
     }
 

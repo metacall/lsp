@@ -230,38 +230,29 @@ fn an_unsafe_shard_name_is_a_rejection() {
 }
 
 #[test]
-fn a_schema_mismatch_is_a_rejection() {
-    let (dir, _file) = workspace("def greet(): pass\n");
-    drop(write(dir.path()));
+fn a_foreign_header_field_is_a_rejection() {
+    for (field, value) in [
+        ("schema_version", serde_json::json!(999)),
+        ("tool_version", serde_json::json!("0.0.0")),
+    ] {
+        let (dir, file) = workspace("def greet(): pass\n");
+        drop(write(dir.path()));
 
-    edit_header(dir.path(), |header| {
-        header["schema_version"] = serde_json::json!(999);
-    });
+        edit_header(dir.path(), |header| header[field] = value.clone());
 
-    let mut reader = Reindexer::with_persistence(Persistence::Enabled);
-    let stats = reader.seed_from_shards(dir.path());
+        let mut reader = Reindexer::with_persistence(Persistence::Enabled);
+        let stats = reader.seed_from_shards(dir.path());
 
-    assert_eq!(stats.reused, 0);
-    assert!(stats.rejected.is_some());
-}
+        assert_eq!(stats.reused, 0, "a {field} mismatch must not reuse records");
+        assert!(
+            stats.rejected.is_some(),
+            "a {field} mismatch rejects the cache"
+        );
 
-#[test]
-fn a_foreign_tool_version_is_a_rejection() {
-    let (dir, file) = workspace("def greet(): pass\n");
-    drop(write(dir.path()));
-
-    edit_header(dir.path(), |header| {
-        header["tool_version"] = serde_json::json!("0.0.0");
-    });
-
-    let mut reader = Reindexer::with_persistence(Persistence::Enabled);
-    let stats = reader.seed_from_shards(dir.path());
-    assert_eq!(stats.reused, 0);
-    assert!(stats.rejected.is_some());
-
-    let snapshot = reader.rebuild(dir.path(), &[]).unwrap();
-    assert!(symbol_names(&snapshot).contains(&"greet".to_string()));
-    assert!(file.is_file());
+        let snapshot = reader.rebuild(dir.path(), &[]).unwrap();
+        assert!(symbol_names(&snapshot).contains(&"greet".to_string()));
+        assert!(file.is_file());
+    }
 }
 
 #[test]

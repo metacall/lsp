@@ -76,6 +76,18 @@ impl<'a> QueryCtx<'a> {
         Some(Location { uri, range })
     }
 
+    /// Declaration range and selection range of one symbol; `selectionRange` names
+    /// the identifier when the engine captured one, else the whole range.
+    pub fn symbol_ranges(&mut self, symbol: &meta_ast::Symbol) -> (Range, Range) {
+        let path = &symbol.file_path;
+        let range = self.range_for(path, &symbol.source_range);
+        let selection = match &symbol.name_range {
+            Some(name_range) => self.range_for(path, name_range),
+            None => range,
+        };
+        (range, selection)
+    }
+
     pub fn diagnostic(&mut self, diagnostic: &meta_ast::Diagnostic) -> lsp_types::Diagnostic {
         let encoding = self.encoding;
         let source = self.file(&diagnostic.path);

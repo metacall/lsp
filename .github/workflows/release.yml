@@ -46,10 +46,10 @@ jobs:
           fi
 
       - name: Test
-        run: cargo test --locked --all-features
+        run: cargo test --locked
 
       - name: Clippy
-        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Format
         run: cargo fmt --check
@@ -122,7 +122,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Build
-        run: cargo build --locked --all-features --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Smoke test
         shell: bash

@@ -7,10 +7,6 @@ use meta_ast::model::{SourceRange, SymbolId};
 use super::IndexSnapshot;
 use crate::types::DocUri;
 
-fn file_for_uri<'a>(snapshot: &'a IndexSnapshot, uri: &DocUri) -> Option<&'a FileExtraction> {
-    snapshot.file_by_path(&uri.to_path()?)
-}
-
 fn contains_byte(range: &SourceRange, byte: usize) -> bool {
     if range.byte_end > range.byte_start {
         range.byte_start <= byte && byte < range.byte_end
@@ -27,16 +23,34 @@ fn range_key(range: &SourceRange) -> (usize, usize, usize) {
     )
 }
 
-/// Innermost symbol containing `byte`; ties break on range key then id, never on engine order.
-pub(super) fn smallest_symbol_at(file: &FileExtraction, byte: usize) -> Option<&meta_ast::Symbol> {
-    file.symbols
-        .iter()
-        .filter(|symbol| contains_byte(&symbol.source_range, byte))
-        .min_by(|a, b| {
-            range_key(&a.source_range)
-                .cmp(&range_key(&b.source_range))
-                .then_with(|| a.id.cmp(&b.id))
+/// Innermost item whose range contains `byte`; ties break on range key, then on `tie`, never on engine order.
+fn innermost<'a, T>(
+    items: impl Iterator<Item = &'a T>,
+    byte: usize,
+    range_of: impl Fn(&T) -> Option<&SourceRange>,
+    tie: impl Fn(&T, &T) -> Ordering,
+) -> Option<&'a T>
+where
+    T: 'a,
+{
+    items
+        .filter_map(|item| range_of(item).map(|range| (item, range)))
+        .filter(|(_, range)| contains_byte(range, byte))
+        .min_by(|(a, a_range), (b, b_range)| {
+            range_key(a_range)
+                .cmp(&range_key(b_range))
+                .then_with(|| tie(a, b))
         })
+        .map(|(item, _)| item)
+}
+
+pub(super) fn smallest_symbol_at(file: &FileExtraction, byte: usize) -> Option<&meta_ast::Symbol> {
+    innermost(
+        file.symbols.iter(),
+        byte,
+        |symbol| Some(&symbol.source_range),
+        |a, b| a.id.cmp(&b.id),
+    )
 }
 
 pub fn symbol_at<'a>(
@@ -44,42 +58,33 @@ pub fn symbol_at<'a>(
     uri: &DocUri,
     byte: usize,
 ) -> Option<&'a meta_ast::Symbol> {
-    let file = file_for_uri(snapshot, uri)?;
-    smallest_symbol_at(file, byte)
+    snapshot
+        .file_by_path(&uri.to_path()?)
+        .and_then(|file| smallest_symbol_at(file, byte))
 }
 
 /// Innermost unresolved reference at `byte`; the reference list is the authority, so unresolvable ones still match.
 fn reference_at(file: &FileExtraction, byte: usize) -> Option<&meta_ast::UnresolvedReference> {
-    file.references
-        .iter()
-        .filter(|reference| contains_byte(&reference.range, byte))
-        .min_by(|a, b| {
-            range_key(&a.range)
-                .cmp(&range_key(&b.range))
-                .then_with(|| a.name.cmp(&b.name))
-        })
+    innermost(
+        file.references.iter(),
+        byte,
+        |reference| Some(&reference.range),
+        |a, b| a.name.cmp(&b.name),
+    )
 }
 
 fn call_site_at(
     file: &FileExtraction,
     byte: usize,
 ) -> Option<&meta_ast::deploy::scanner::CallSite> {
-    file.call_sites
-        .iter()
-        .filter(|site| {
-            site.variant == meta_ast::deploy::scanner::CallSiteVariant::ClientCall
-                && site
-                    .source_range
-                    .as_ref()
-                    .is_some_and(|range| contains_byte(range, byte))
-        })
-        .min_by(|a, b| {
-            a.source_range
-                .as_ref()
-                .map(range_key)
-                .cmp(&b.source_range.as_ref().map(range_key))
-                .then_with(|| a.function_name.cmp(&b.function_name))
-        })
+    innermost(
+        file.call_sites
+            .iter()
+            .filter(|site| site.variant == meta_ast::deploy::scanner::CallSiteVariant::ClientCall),
+        byte,
+        |site| site.source_range.as_ref(),
+        |a, b| a.function_name.cmp(&b.function_name),
+    )
 }
 
 /// Total order over resolved targets: declaring path, declaration byte, id; confidence is not in the key.
@@ -191,6 +196,51 @@ mod tests {
     use crate::index::rebuild_from_inputs;
 
     use crate::testutil::doc_uri;
+
+    #[test]
+    fn innermost_picks_the_smallest_range_and_breaks_ties_on_the_key() {
+        struct Item {
+            range: SourceRange,
+            name: &'static str,
+        }
+        let range = |start: usize, end: usize| SourceRange {
+            byte_start: start,
+            byte_end: end,
+            start: meta_ast::model::LineColumn {
+                line: 0,
+                column: start,
+            },
+            end: meta_ast::model::LineColumn {
+                line: 0,
+                column: end,
+            },
+        };
+        let items = [
+            Item {
+                range: range(0, 100),
+                name: "outer",
+            },
+            Item {
+                range: range(10, 20),
+                name: "inner",
+            },
+            Item {
+                range: range(10, 20),
+                name: "twin",
+            },
+        ];
+        let tie = |a: &Item, b: &Item| a.name.cmp(b.name);
+
+        assert_eq!(
+            innermost(items.iter(), 15, |item| Some(&item.range), tie).map(|item| item.name),
+            Some("inner"),
+            "the smallest containing range wins; equal ranges break on the tie key"
+        );
+        assert!(
+            innermost(items.iter(), 200, |item| Some(&item.range), tie).is_none(),
+            "a byte outside every range matches nothing"
+        );
+    }
 
     #[test]
     fn unresolved_reference_does_not_fall_back_to_caller() {
@@ -334,10 +384,6 @@ mod tests {
             sites.len(),
             1,
             "a recursive call is a real use site: {sites:?}"
-        );
-        assert_eq!(
-            snapshot.references[0].source, snapshot.references[0].target,
-            "the engine records the recursive use as a self reference"
         );
     }
 }

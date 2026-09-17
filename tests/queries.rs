@@ -3,20 +3,34 @@ use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use lsp_types::Position;
 use meta_call_lsp::buffers::{BufferStore, OpenOutcome};
 use meta_call_lsp::handlers::QueryCtx;
-use meta_call_lsp::index::SourceText;
+use meta_call_lsp::index::{IndexSnapshot, SourceText};
 use meta_call_lsp::position::Encoding;
 use meta_call_lsp::types::{DocUri, DocVersion};
-use meta_call_lsp::{convert, handlers, index};
+use meta_call_lsp::{handlers, index};
+
+mod common;
+
+use common::{doc_uri, uri_of};
 
 const APP: &str =
     "def greet(name):\n    \"\"\"Say hi.\"\"\"\n    return name\n\n\nresult = greet(\"x\")\n";
 const TS: &str = "export function add(a: number, b: number): number {\n  return a + b;\n}\n";
 const EMOJI_TS: &str =
     "const snake = \"\u{1f40d}\"; function add(a: number, b: number): number { return a + b; }\n";
+const UTIL: &str = "def helper(value):\n    return value\n";
+const APP_IMPORT: &str = "from util import helper\n\n\ndef run():\n    return helper(1)\n";
+const TWO_CALLS: &str = "from util import helper\n\n\ndef run():\n    a = helper(1)\n    b = helper(2)\n    return a + b\n";
+const AMBIGUOUS_CALLER: &str = "from a import dup\nfrom b import dup\n\n\nx = dup()\n";
+const DUP: &str = "def dup(): pass\n";
+const MIXED_JS: &str = "'use strict';\n\nfunction multiply(a, b) {\n\treturn a * b;\n}\n\nmodule.exports = { multiply };\n";
+const MIXED_PY: &str = "from metacall import metacall, metacall_load_from_file\n\nmetacall_load_from_file(\"node\", [\"math.js\"])\n\n\ndef compute_total(units, price):\n    return metacall(\"multiply\", units, price)\n";
+const TRANSITIVE_MID: &str = "from util import helper\n\n\ndef wrapper():\n    return helper(1)\n";
+const TRANSITIVE_FAR: &str = "from mid import wrapper\n\n\ndef run():\n    return helper(2)\n";
 
 /// Test source lookup. Mirrors the server: overlay text wins over disk.
 struct TestSources {
@@ -56,25 +70,19 @@ impl SourceText for TestSources {
     }
 }
 
-fn workspace() -> (tempfile::TempDir, PathBuf, PathBuf) {
-    let dir = tempfile::tempdir().unwrap();
-    let app = dir.path().join("a.py");
-    let ts = dir.path().join("b.ts");
-    std::fs::write(&app, APP).unwrap();
-    std::fs::write(&ts, TS).unwrap();
-    (dir, app, ts)
-}
-
-fn doc_uri(value: &str) -> DocUri {
-    DocUri::try_from(value).expect("document URI")
-}
-
-fn uri_of(path: &Path) -> DocUri {
-    DocUri::try_from(convert::path_to_uri(path).unwrap().as_str()).expect("document URI")
-}
-
-fn snapshot(dir: &Path, buffers: &BufferStore) -> std::sync::Arc<index::IndexSnapshot> {
+/// Index of `dir` with `buffers` as overlays, as a reindex pass would build it.
+fn indexed(dir: &Path, buffers: &BufferStore) -> Arc<IndexSnapshot> {
     index::rebuild_from_inputs(dir, &index::collect_inputs(dir, buffers)).unwrap()
+}
+
+/// Temp workspace holding `files`, indexed from disk, plus a disk source lookup.
+fn workspace(files: &[(&str, &str)]) -> (tempfile::TempDir, Arc<IndexSnapshot>, TestSources) {
+    let dir = tempfile::tempdir().unwrap();
+    for (name, content) in files {
+        std::fs::write(dir.path().join(name), content).unwrap();
+    }
+    let snapshot = indexed(dir.path(), &BufferStore::default());
+    (dir, snapshot, TestSources::disk())
 }
 
 fn pos(line: u32, character: u32) -> Position {
@@ -82,7 +90,7 @@ fn pos(line: u32, character: u32) -> Position {
 }
 
 fn definition_locations(
-    snapshot: &std::sync::Arc<index::IndexSnapshot>,
+    snapshot: &Arc<IndexSnapshot>,
     sources: &TestSources,
     uri: &DocUri,
     position: Position,
@@ -104,8 +112,7 @@ fn definition_locations(
 
 #[test]
 fn cold_rebuild_finds_symbols() {
-    let (dir, _, _) = workspace();
-    let snapshot = snapshot(dir.path(), &BufferStore::default());
+    let (_dir, snapshot, _sources) = workspace(&[("a.py", APP), ("b.ts", TS)]);
     assert_eq!(snapshot.extractions.len(), 2);
     let names: Vec<&str> = snapshot
         .extractions
@@ -119,12 +126,10 @@ fn cold_rebuild_finds_symbols() {
 
 #[test]
 fn document_symbols_lists_file_symbols() {
-    let (dir, app, _) = workspace();
-    let snapshot = snapshot(dir.path(), &BufferStore::default());
-    let sources = TestSources::disk();
+    let (dir, snapshot, sources) = workspace(&[("a.py", APP), ("b.ts", TS)]);
     let symbols = handlers::document_symbols(
         &mut QueryCtx::new(&snapshot, &sources, Encoding::Utf16),
-        &uri_of(&app),
+        &uri_of(&dir.path().join("a.py")),
     );
     let greet = symbols
         .iter()
@@ -148,10 +153,8 @@ fn document_symbols_lists_file_symbols() {
 // A definition link selects the identifier inside the target, not the declaration.
 #[test]
 fn definition_links_select_the_identifier() {
-    let (dir, app, _) = workspace();
-    let snapshot = snapshot(dir.path(), &BufferStore::default());
-    let sources = TestSources::disk();
-    let uri = uri_of(&app);
+    let (dir, snapshot, sources) = workspace(&[("a.py", APP), ("b.ts", TS)]);
+    let uri = uri_of(&dir.path().join("a.py"));
 
     let response = handlers::definition_at(
         &mut QueryCtx::new(&snapshot, &sources, Encoding::Utf16),
@@ -176,12 +179,10 @@ fn definition_links_select_the_identifier() {
 
 #[test]
 fn hover_shows_signature() {
-    let (dir, app, _) = workspace();
-    let snapshot = snapshot(dir.path(), &BufferStore::default());
-    let sources = TestSources::disk();
+    let (dir, snapshot, sources) = workspace(&[("a.py", APP), ("b.ts", TS)]);
     let hover = handlers::hover_at(
         &mut QueryCtx::new(&snapshot, &sources, Encoding::Utf16),
-        &uri_of(&app),
+        &uri_of(&dir.path().join("a.py")),
         pos(0, 5),
     )
     .unwrap();
@@ -198,10 +199,8 @@ fn hover_shows_signature() {
 
 #[test]
 fn definition_resolves_reference_to_def() {
-    let (dir, app, _) = workspace();
-    let snapshot = snapshot(dir.path(), &BufferStore::default());
-    let sources = TestSources::disk();
-    let uri = uri_of(&app);
+    let (dir, snapshot, sources) = workspace(&[("a.py", APP), ("b.ts", TS)]);
+    let uri = uri_of(&dir.path().join("a.py"));
     let locations = definition_locations(&snapshot, &sources, &uri, pos(5, 10));
     assert_eq!(locations.len(), 1);
     assert_eq!(locations[0].0, uri.as_str());
@@ -210,7 +209,9 @@ fn definition_resolves_reference_to_def() {
 
 #[test]
 fn buffer_override_adds_symbol() {
-    let (dir, app, _) = workspace();
+    let dir = tempfile::tempdir().unwrap();
+    let app = dir.path().join("a.py");
+    std::fs::write(&app, APP).unwrap();
     let uri = uri_of(&app);
     let mut buffers = BufferStore::default();
     assert_eq!(
@@ -222,7 +223,7 @@ fn buffer_override_adds_symbol() {
         ),
         OpenOutcome::Indexed
     );
-    let snapshot = snapshot(dir.path(), &buffers);
+    let snapshot = indexed(dir.path(), &buffers);
     let sources = TestSources::from_buffers(&buffers);
     let symbols = handlers::document_symbols(
         &mut QueryCtx::new(&snapshot, &sources, Encoding::Utf16),
@@ -241,9 +242,7 @@ fn buffer_override_adds_symbol() {
 
 #[test]
 fn unknown_uri_returns_empty() {
-    let (dir, _, _) = workspace();
-    let snapshot = snapshot(dir.path(), &BufferStore::default());
-    let sources = TestSources::disk();
+    let (_dir, snapshot, sources) = workspace(&[("a.py", APP), ("b.ts", TS)]);
     assert!(
         handlers::document_symbols(
             &mut QueryCtx::new(&snapshot, &sources, Encoding::Utf16),
@@ -272,12 +271,8 @@ fn unknown_uri_returns_empty() {
 
 #[test]
 fn ranges_follow_negotiated_encoding() {
-    let dir = tempfile::tempdir().unwrap();
-    let ts = dir.path().join("c.ts");
-    std::fs::write(&ts, EMOJI_TS).unwrap();
-    let snapshot = snapshot(dir.path(), &BufferStore::default());
-    let sources = TestSources::disk();
-    let uri = uri_of(&ts);
+    let (dir, snapshot, sources) = workspace(&[("c.ts", EMOJI_TS)]);
+    let uri = uri_of(&dir.path().join("c.ts"));
 
     let utf8 = handlers::document_symbols(
         &mut QueryCtx::new(&snapshot, &sources, Encoding::Utf8),
@@ -317,58 +312,44 @@ fn ranges_follow_negotiated_encoding() {
     );
 }
 
-const UTIL: &str = "def helper(value):\n    return value\n";
-const APP_IMPORT: &str = "from util import helper\n\n\ndef run():\n    return helper(1)\n";
-
 #[test]
 fn cross_file_definition_and_references() {
-    let dir = tempfile::tempdir().unwrap();
-    let util = dir.path().join("util.py");
-    let app = dir.path().join("app.py");
-    std::fs::write(&util, UTIL).unwrap();
-    std::fs::write(&app, APP_IMPORT).unwrap();
-    let snapshot = snapshot(dir.path(), &BufferStore::default());
-    let sources = TestSources::disk();
+    let (dir, snapshot, sources) = workspace(&[("util.py", UTIL), ("app.py", APP_IMPORT)]);
 
-    let locations = definition_locations(&snapshot, &sources, &uri_of(&app), pos(4, 13));
+    let locations = definition_locations(
+        &snapshot,
+        &sources,
+        &uri_of(&dir.path().join("app.py")),
+        pos(4, 13),
+    );
     assert_eq!(locations.len(), 1);
-    assert_eq!(locations[0].0, uri_of(&util).as_str());
+    assert_eq!(locations[0].0, uri_of(&dir.path().join("util.py")).as_str());
     assert_eq!(locations[0].1.start.line, 0);
 
     // The per-request cache must read each distinct file once.
     sources.reads.set(0);
     let references = handlers::references_at(
         &mut QueryCtx::new(&snapshot, &sources, Encoding::Utf16),
-        &uri_of(&util),
+        &uri_of(&dir.path().join("util.py")),
         pos(0, 6),
         true,
     );
     assert!(
         references
             .iter()
-            .any(|location| location.uri.as_str() == uri_of(&app).as_str())
+            .any(|location| location.uri.as_str() == uri_of(&dir.path().join("app.py")).as_str())
     );
     assert!(
         references
             .iter()
-            .any(|location| location.uri.as_str() == uri_of(&util).as_str())
+            .any(|location| location.uri.as_str() == uri_of(&dir.path().join("util.py")).as_str())
     );
     assert_eq!(sources.reads.get(), 2);
 }
 
 #[test]
 fn repeated_references_collapse_to_one_edge() {
-    let dir = tempfile::tempdir().unwrap();
-    let util = dir.path().join("util.py");
-    let app = dir.path().join("app.py");
-    std::fs::write(&util, "def helper(value):\n    return value\n").unwrap();
-    std::fs::write(
-        &app,
-        "from util import helper\n\n\ndef run():\n    a = helper(1)\n    b = helper(2)\n    return a + b\n",
-    )
-    .unwrap();
-    let snapshot = snapshot(dir.path(), &BufferStore::default());
-    let sources = TestSources::disk();
+    let (dir, snapshot, sources) = workspace(&[("util.py", UTIL), ("app.py", TWO_CALLS)]);
 
     let helper = snapshot
         .symbols()
@@ -390,7 +371,7 @@ fn repeated_references_collapse_to_one_edge() {
 
     let references = handlers::references_at(
         &mut QueryCtx::new(&snapshot, &sources, Encoding::Utf16),
-        &uri_of(&util),
+        &uri_of(&dir.path().join("util.py")),
         pos(0, 6),
         true,
     );
@@ -403,13 +384,10 @@ fn repeated_references_collapse_to_one_edge() {
 
 #[test]
 fn workspace_symbols_read_each_file_once() {
-    let dir = tempfile::tempdir().unwrap();
-    let alpha_beta = dir.path().join("alpha_beta.py");
-    let gamma = dir.path().join("gamma.py");
-    std::fs::write(&alpha_beta, "def alpha(): pass\n\n\ndef beta(): pass\n").unwrap();
-    std::fs::write(&gamma, "def gamma(): pass\n").unwrap();
-    let snapshot = snapshot(dir.path(), &BufferStore::default());
-    let sources = TestSources::disk();
+    let (_dir, snapshot, sources) = workspace(&[
+        ("alpha_beta.py", "def alpha(): pass\n\n\ndef beta(): pass\n"),
+        ("gamma.py", "def gamma(): pass\n"),
+    ]);
 
     let symbols =
         handlers::workspace_symbols(&mut QueryCtx::new(&snapshot, &sources, Encoding::Utf16), "");
@@ -421,19 +399,14 @@ fn workspace_symbols_read_each_file_once() {
 
 #[test]
 fn completion_matches_case_insensitively_when_exact_matches_are_absent() {
-    let dir = tempfile::tempdir().unwrap();
-    let app = dir.path().join("cased.py");
-    std::fs::write(
-        &app,
+    let (dir, snapshot, sources) = workspace(&[(
+        "cased.py",
         "def GREET(): pass\n\n\ndef use_greeting():\n    selection = gre\n",
-    )
-    .unwrap();
-    let snapshot = snapshot(dir.path(), &BufferStore::default());
-    let sources = TestSources::disk();
+    )]);
 
     let items = handlers::completion_at(
         &mut QueryCtx::new(&snapshot, &sources, Encoding::Utf16),
-        &uri_of(&app),
+        &uri_of(&dir.path().join("cased.py")),
         pos(4, 15),
     );
     let item = items
@@ -445,9 +418,7 @@ fn completion_matches_case_insensitively_when_exact_matches_are_absent() {
 
 #[test]
 fn workspace_symbols_filter_by_query() {
-    let (dir, _, _) = workspace();
-    let snapshot = snapshot(dir.path(), &BufferStore::default());
-    let sources = TestSources::disk();
+    let (_dir, snapshot, sources) = workspace(&[("a.py", APP), ("b.ts", TS)]);
 
     let all =
         handlers::workspace_symbols(&mut QueryCtx::new(&snapshot, &sources, Encoding::Utf16), "");
@@ -464,13 +435,10 @@ fn workspace_symbols_filter_by_query() {
 
 #[test]
 fn workspace_symbols_match_exactly_then_by_substring() {
-    let dir = tempfile::tempdir().unwrap();
-    let a = dir.path().join("a.py");
-    let z = dir.path().join("z.py");
-    std::fs::write(&a, "def greeting(): pass\n").unwrap();
-    std::fs::write(&z, "def greet(): pass\n").unwrap();
-    let snapshot = snapshot(dir.path(), &BufferStore::default());
-    let sources = TestSources::disk();
+    let (_dir, snapshot, sources) = workspace(&[
+        ("a.py", "def greeting(): pass\n"),
+        ("z.py", "def greet(): pass\n"),
+    ]);
 
     let matched = handlers::workspace_symbols(
         &mut QueryCtx::new(&snapshot, &sources, Encoding::Utf16),
@@ -486,9 +454,7 @@ fn workspace_symbols_match_exactly_then_by_substring() {
 
 #[test]
 fn workspace_symbols_have_no_fuzzy_tier() {
-    let (dir, _, _) = workspace();
-    let snapshot = snapshot(dir.path(), &BufferStore::default());
-    let sources = TestSources::disk();
+    let (_dir, snapshot, sources) = workspace(&[("a.py", APP), ("b.ts", TS)]);
 
     let matched = handlers::workspace_symbols(
         &mut QueryCtx::new(&snapshot, &sources, Encoding::Utf16),
@@ -503,11 +469,7 @@ fn workspace_symbols_have_no_fuzzy_tier() {
 
 #[test]
 fn workspace_symbols_match_non_ascii_case_insensitively() {
-    let dir = tempfile::tempdir().unwrap();
-    let file = dir.path().join("naive.py");
-    std::fs::write(&file, "def naïve(): pass\n").unwrap();
-    let snapshot = snapshot(dir.path(), &BufferStore::default());
-    let sources = TestSources::disk();
+    let (_dir, snapshot, sources) = workspace(&[("naive.py", "def naïve(): pass\n")]);
 
     let matched = handlers::workspace_symbols(
         &mut QueryCtx::new(&snapshot, &sources, Encoding::Utf16),
@@ -520,13 +482,10 @@ fn workspace_symbols_match_non_ascii_case_insensitively() {
 
 #[test]
 fn workspace_symbols_empty_query_returns_all_in_documented_order() {
-    let dir = tempfile::tempdir().unwrap();
-    let a = dir.path().join("a.py");
-    let b = dir.path().join("b.py");
-    std::fs::write(&a, "def zeta(): pass\n\n\ndef alpha(): pass\n").unwrap();
-    std::fs::write(&b, "def beta(): pass\n").unwrap();
-    let snapshot = snapshot(dir.path(), &BufferStore::default());
-    let sources = TestSources::disk();
+    let (dir, snapshot, sources) = workspace(&[
+        ("a.py", "def zeta(): pass\n\n\ndef alpha(): pass\n"),
+        ("b.py", "def beta(): pass\n"),
+    ]);
 
     let symbols =
         handlers::workspace_symbols(&mut QueryCtx::new(&snapshot, &sources, Encoding::Utf16), "");
@@ -544,19 +503,20 @@ fn workspace_symbols_empty_query_returns_all_in_documented_order() {
     let lsp_types::OneOf::Left(location) = &symbols[0].location else {
         panic!("a workspace symbol carries a full location");
     };
-    assert_eq!(location.uri.as_str(), uri_of(&a).as_str());
+    assert_eq!(
+        location.uri.as_str(),
+        uri_of(&dir.path().join("a.py")).as_str()
+    );
 }
 
 #[test]
 fn completion_lists_visible_symbols() {
-    let (dir, app, _) = workspace();
-    let snapshot = snapshot(dir.path(), &BufferStore::default());
-    let sources = TestSources::disk();
+    let (dir, snapshot, sources) = workspace(&[("a.py", APP), ("b.ts", TS)]);
 
     // Cursor after `def gre` on line 0: prefix "gre".
     let items = handlers::completion_at(
         &mut QueryCtx::new(&snapshot, &sources, Encoding::Utf16),
-        &uri_of(&app),
+        &uri_of(&dir.path().join("a.py")),
         pos(0, 7),
     );
     assert!(items.iter().any(|item| item.label == "greet"));
@@ -567,32 +527,19 @@ fn completion_lists_visible_symbols() {
     }));
 }
 
-const MIXED_JS: &str = "'use strict';\n\nfunction multiply(a, b) {\n\treturn a * b;\n}\n\nmodule.exports = { multiply };\n";
-const MIXED_PY: &str = "from metacall import metacall, metacall_load_from_file\n\nmetacall_load_from_file(\"node\", [\"math.js\"])\n\n\ndef compute_total(units, price):\n    return metacall(\"multiply\", units, price)\n";
-
 #[test]
 fn references_point_at_each_call_site() {
-    let dir = tempfile::tempdir().unwrap();
-    let util = dir.path().join("util.py");
-    let app = dir.path().join("app.py");
-    std::fs::write(&util, UTIL).unwrap();
-    std::fs::write(
-        &app,
-        "from util import helper\n\n\ndef run():\n    a = helper(1)\n    b = helper(2)\n    return a + b\n",
-    )
-    .unwrap();
-    let snapshot = snapshot(dir.path(), &BufferStore::default());
-    let sources = TestSources::disk();
+    let (dir, snapshot, sources) = workspace(&[("util.py", UTIL), ("app.py", TWO_CALLS)]);
 
     let references = handlers::references_at(
         &mut QueryCtx::new(&snapshot, &sources, Encoding::Utf16),
-        &uri_of(&util),
+        &uri_of(&dir.path().join("util.py")),
         pos(0, 6),
         false,
     );
     let mut app_lines: Vec<u32> = references
         .iter()
-        .filter(|location| location.uri.as_str() == uri_of(&app).as_str())
+        .filter(|location| location.uri.as_str() == uri_of(&dir.path().join("app.py")).as_str())
         .map(|location| location.range.start.line)
         .collect();
     app_lines.sort_unstable();
@@ -605,35 +552,34 @@ fn references_point_at_each_call_site() {
 
 #[test]
 fn metacall_cross_language_definition_and_references() {
-    let dir = tempfile::tempdir().unwrap();
-    let js = dir.path().join("math.js");
-    let py = dir.path().join("orchestrator.py");
-    std::fs::write(&js, MIXED_JS).unwrap();
-    std::fs::write(&py, MIXED_PY).unwrap();
-    let snapshot = snapshot(dir.path(), &BufferStore::default());
-    let sources = TestSources::disk();
+    let (dir, snapshot, sources) =
+        workspace(&[("math.js", MIXED_JS), ("orchestrator.py", MIXED_PY)]);
 
-    let locations = definition_locations(&snapshot, &sources, &uri_of(&py), pos(6, 25));
+    let locations = definition_locations(
+        &snapshot,
+        &sources,
+        &uri_of(&dir.path().join("orchestrator.py")),
+        pos(6, 25),
+    );
     assert_eq!(locations.len(), 1);
-    assert_eq!(locations[0].0, uri_of(&js).as_str());
+    assert_eq!(locations[0].0, uri_of(&dir.path().join("math.js")).as_str());
     assert_eq!(locations[0].1.start.line, 2);
 
     let references = handlers::references_at(
         &mut QueryCtx::new(&snapshot, &sources, Encoding::Utf16),
-        &uri_of(&js),
+        &uri_of(&dir.path().join("math.js")),
         pos(2, 12),
         true,
     );
     assert!(
-        references
-            .iter()
-            .any(|location| location.uri.as_str() == uri_of(&py).as_str())
+        references.iter().any(|location| location.uri.as_str()
+            == uri_of(&dir.path().join("orchestrator.py")).as_str())
     );
 
     // The cursor sits after "mu", so completion offers the cross-language target.
     let items = handlers::completion_at(
         &mut QueryCtx::new(&snapshot, &sources, Encoding::Utf16),
-        &uri_of(&py),
+        &uri_of(&dir.path().join("orchestrator.py")),
         pos(6, 23),
     );
     assert!(items.iter().any(|item| item.label == "multiply"));
@@ -642,10 +588,8 @@ fn metacall_cross_language_definition_and_references() {
 /// The second client-call resolution must not report a diagnostic twice.
 #[test]
 fn a_metacall_workspace_reports_no_duplicate_diagnostic() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("math.js"), MIXED_JS).unwrap();
-    std::fs::write(dir.path().join("orchestrator.py"), MIXED_PY).unwrap();
-    let snapshot = snapshot(dir.path(), &BufferStore::default());
+    let (_dir, snapshot, _sources) =
+        workspace(&[("math.js", MIXED_JS), ("orchestrator.py", MIXED_PY)]);
 
     let mut seen = std::collections::HashSet::new();
     for diagnostic in &snapshot.diagnostics {
@@ -667,16 +611,14 @@ fn a_metacall_workspace_reports_no_duplicate_diagnostic() {
 /// Expanding every record would index one ambiguous call site once per target squared.
 #[test]
 fn an_ambiguous_client_call_indexes_each_use_site_once() {
-    let dir = tempfile::tempdir().unwrap();
-    let js = MIXED_JS;
-    std::fs::write(dir.path().join("helpers.js"), js).unwrap();
-    std::fs::write(dir.path().join("utils.js"), js).unwrap();
-    std::fs::write(
-        dir.path().join("orchestrator.py"),
-        "from metacall import metacall\n\n\ndef compute_total(units, price):\n    return metacall(\"multiply\", units, price)\n",
-    )
-    .unwrap();
-    let snapshot = snapshot(dir.path(), &BufferStore::default());
+    let (_dir, snapshot, _sources) = workspace(&[
+        ("helpers.js", MIXED_JS),
+        ("utils.js", MIXED_JS),
+        (
+            "orchestrator.py",
+            "from metacall import metacall\n\n\ndef compute_total(units, price):\n    return metacall(\"multiply\", units, price)\n",
+        ),
+    ]);
 
     let targets: Vec<meta_ast::model::SymbolId> = snapshot
         .client_calls
@@ -698,16 +640,10 @@ fn an_ambiguous_client_call_indexes_each_use_site_once() {
     }
 }
 
-const TRANSITIVE_UTIL: &str = "def helper(value):\n    return value\n";
-const TRANSITIVE_MID: &str = "from util import helper\n\n\ndef wrapper():\n    return helper(1)\n";
-const TRANSITIVE_FAR: &str = "from mid import wrapper\n\n\ndef run():\n    return helper(2)\n";
-
 #[test]
 fn definition_links_carry_the_origin_range() {
-    let (dir, app, _) = workspace();
-    let snapshot = snapshot(dir.path(), &BufferStore::default());
-    let sources = TestSources::disk();
-    let uri = uri_of(&app);
+    let (dir, snapshot, sources) = workspace(&[("a.py", APP), ("b.ts", TS)]);
+    let uri = uri_of(&dir.path().join("a.py"));
 
     let response = handlers::definition_at(
         &mut QueryCtx::new(&snapshot, &sources, Encoding::Utf16),
@@ -727,19 +663,21 @@ fn definition_links_carry_the_origin_range() {
     );
 }
 
+/// One name declared twice, both imported by a caller that calls it once.
+fn ambiguous_dup_workspace() -> (tempfile::TempDir, Arc<IndexSnapshot>, TestSources) {
+    workspace(&[("a.py", DUP), ("b.py", DUP), ("c.py", AMBIGUOUS_CALLER)])
+}
+
 #[test]
 fn definition_returns_every_candidate() {
-    let dir = tempfile::tempdir().unwrap();
-    let a = dir.path().join("a.py");
-    let b = dir.path().join("b.py");
-    let c = dir.path().join("c.py");
-    std::fs::write(&a, "def dup(): pass\n").unwrap();
-    std::fs::write(&b, "def dup(): pass\n").unwrap();
-    std::fs::write(&c, "from a import dup\nfrom b import dup\n\n\nx = dup()\n").unwrap();
-    let snapshot = snapshot(dir.path(), &BufferStore::default());
-    let sources = TestSources::disk();
+    let (dir, snapshot, sources) = ambiguous_dup_workspace();
 
-    let locations = definition_locations(&snapshot, &sources, &uri_of(&c), pos(4, 5));
+    let locations = definition_locations(
+        &snapshot,
+        &sources,
+        &uri_of(&dir.path().join("c.py")),
+        pos(4, 5),
+    );
 
     assert_eq!(
         locations.len(),
@@ -749,7 +687,10 @@ fn definition_returns_every_candidate() {
     let uris: Vec<&str> = locations.iter().map(|(uri, _)| uri.as_str()).collect();
     assert_eq!(
         uris,
-        [uri_of(&a).as_str(), uri_of(&b).as_str()],
+        [
+            uri_of(&dir.path().join("a.py")).as_str(),
+            uri_of(&dir.path().join("b.py")).as_str()
+        ],
         "targets order by declaration site, not by score"
     );
 }
@@ -757,24 +698,25 @@ fn definition_returns_every_candidate() {
 /// A shadowing definition prunes the imported candidate; the server returns that set.
 #[test]
 fn a_shadowing_definition_prunes_the_imported_candidate() {
-    let dir = tempfile::tempdir().unwrap();
-    let a = dir.path().join("a.py");
-    let b = dir.path().join("b.py");
-    let c = dir.path().join("c.py");
-    std::fs::write(&a, "def dup(): pass\n").unwrap();
-    std::fs::write(&b, "from a import dup\n\n\ndef dup(): pass\n").unwrap();
-    std::fs::write(&c, "from b import dup\n\n\nx = dup()\n").unwrap();
-    let snapshot = snapshot(dir.path(), &BufferStore::default());
-    let sources = TestSources::disk();
+    let (dir, snapshot, sources) = workspace(&[
+        ("a.py", DUP),
+        ("b.py", "from a import dup\n\n\ndef dup(): pass\n"),
+        ("c.py", "from b import dup\n\n\nx = dup()\n"),
+    ]);
 
-    let locations = definition_locations(&snapshot, &sources, &uri_of(&c), pos(3, 5));
+    let locations = definition_locations(
+        &snapshot,
+        &sources,
+        &uri_of(&dir.path().join("c.py")),
+        pos(3, 5),
+    );
 
     assert_eq!(
         locations.len(),
         1,
         "the shadowed import is not a candidate, got {locations:?}"
     );
-    assert_eq!(locations[0].0, uri_of(&b).as_str());
+    assert_eq!(locations[0].0, uri_of(&dir.path().join("b.py")).as_str());
     assert_eq!(
         locations[0].1.start.line, 3,
         "the target is b.py's own definition"
@@ -783,19 +725,15 @@ fn a_shadowing_definition_prunes_the_imported_candidate() {
 
 #[test]
 fn references_order_by_path_then_byte() {
-    let dir = tempfile::tempdir().unwrap();
-    let util = dir.path().join("util.py");
-    let mid = dir.path().join("mid.py");
-    let far = dir.path().join("far.py");
-    std::fs::write(&util, TRANSITIVE_UTIL).unwrap();
-    std::fs::write(&mid, TRANSITIVE_MID).unwrap();
-    std::fs::write(&far, TRANSITIVE_FAR).unwrap();
-    let snapshot = snapshot(dir.path(), &BufferStore::default());
-    let sources = TestSources::disk();
+    let (dir, snapshot, sources) = workspace(&[
+        ("util.py", UTIL),
+        ("mid.py", TRANSITIVE_MID),
+        ("far.py", TRANSITIVE_FAR),
+    ]);
 
     let helper_from_util = snapshot
         .symbols()
-        .find(|symbol| symbol.name == "helper" && symbol.file_path == util)
+        .find(|symbol| symbol.name == "helper" && symbol.file_path == dir.path().join("util.py"))
         .expect("helper");
     assert_eq!(
         snapshot.occurrences_of(helper_from_util.id).len(),
@@ -806,7 +744,7 @@ fn references_order_by_path_then_byte() {
     // The declaration comes first, then use sites in path order: confidence never orders.
     let references = handlers::references_at(
         &mut QueryCtx::new(&snapshot, &sources, Encoding::Utf16),
-        &uri_of(&util),
+        &uri_of(&dir.path().join("util.py")),
         pos(0, 6),
         true,
     );
@@ -817,25 +755,17 @@ fn references_order_by_path_then_byte() {
     assert_eq!(
         order,
         [
-            (uri_of(&util).as_str(), 0),
-            (uri_of(&far).as_str(), 4),
-            (uri_of(&mid).as_str(), 4),
+            (uri_of(&dir.path().join("util.py")).as_str(), 0),
+            (uri_of(&dir.path().join("far.py")).as_str(), 4),
+            (uri_of(&dir.path().join("mid.py")).as_str(), 4),
         ]
     );
 }
 
 #[test]
 fn definition_shapes_carry_the_same_target_set() {
-    let dir = tempfile::tempdir().unwrap();
-    let a = dir.path().join("a.py");
-    let b = dir.path().join("b.py");
-    let c = dir.path().join("c.py");
-    std::fs::write(&a, "def dup(): pass\n").unwrap();
-    std::fs::write(&b, "def dup(): pass\n").unwrap();
-    std::fs::write(&c, "from a import dup\nfrom b import dup\n\n\nx = dup()\n").unwrap();
-    let snapshot = snapshot(dir.path(), &BufferStore::default());
-    let sources = TestSources::disk();
-    let uri = uri_of(&c);
+    let (dir, snapshot, sources) = ambiguous_dup_workspace();
+    let uri = uri_of(&dir.path().join("c.py"));
 
     let plain = definition_locations(&snapshot, &sources, &uri, pos(4, 5));
     assert_eq!(
@@ -865,14 +795,8 @@ fn definition_shapes_carry_the_same_target_set() {
 
 #[test]
 fn references_put_the_declaration_first_only_when_requested() {
-    let dir = tempfile::tempdir().unwrap();
-    let util = dir.path().join("util.py");
-    let app = dir.path().join("app.py");
-    std::fs::write(&util, UTIL).unwrap();
-    std::fs::write(&app, APP_IMPORT).unwrap();
-    let snapshot = snapshot(dir.path(), &BufferStore::default());
-    let sources = TestSources::disk();
-    let uri = uri_of(&util);
+    let (dir, snapshot, sources) = workspace(&[("util.py", UTIL), ("app.py", APP_IMPORT)]);
+    let uri = uri_of(&dir.path().join("util.py"));
 
     let with_declaration = handlers::references_at(
         &mut QueryCtx::new(&snapshot, &sources, Encoding::Utf16),
@@ -897,13 +821,13 @@ fn references_put_the_declaration_first_only_when_requested() {
         order(&with_declaration),
         [
             (uri.as_str().to_string(), 0),
-            (uri_of(&app).as_str().to_string(), 4)
+            (uri_of(&dir.path().join("app.py")).as_str().to_string(), 4)
         ],
         "the declaration is the first result when requested"
     );
     assert_eq!(
         order(&without_declaration),
-        [(uri_of(&app).as_str().to_string(), 4)],
+        [(uri_of(&dir.path().join("app.py")).as_str().to_string(), 4)],
         "only use sites remain when the declaration is not requested"
     );
 }

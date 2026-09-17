@@ -13,7 +13,7 @@ use lsp_types::{
 };
 
 use crate::position::Encoding;
-use crate::server::ids::{WATCHED_FILES_REGISTRATION, watched_files_request_id};
+use crate::server::ids::{self, WATCHED_FILES_REGISTRATION, watched_files_request_id};
 use crate::types::{DocUri, RootDir};
 
 /// Files whose contents shape engine resolver state for the process lifetime.
@@ -48,7 +48,7 @@ pub(crate) fn capabilities(encoding: Encoding) -> ServerCapabilities {
             ..Default::default()
         }),
         diagnostic_provider: Some(DiagnosticServerCapabilities::Options(DiagnosticOptions {
-            identifier: Some("meta-ast".to_string()),
+            identifier: Some(ids::DIAGNOSTIC_SOURCE.to_string()),
             inter_file_dependencies: false,
             workspace_diagnostics: false,
             work_done_progress_options: WorkDoneProgressOptions::default(),
@@ -161,10 +161,14 @@ mod tests {
     use crate::convert;
 
     #[test]
-    fn watched_globs_cover_supported_extensions() {
+    fn watched_globs_cover_extensions_and_resolver_configs() {
         let globs = watched_globs();
-        assert!(globs.iter().any(|glob| glob == "**/*.py"));
-        assert!(globs.iter().any(|glob| glob == "**/*.ts"));
+        for expected in ["**/*.py", "**/*.ts", "**/tsconfig.json", "**/go.mod"] {
+            assert!(
+                globs.iter().any(|glob| glob == expected),
+                "{expected} must be watched: {globs:?}"
+            );
+        }
     }
 
     #[test]
@@ -177,13 +181,6 @@ mod tests {
             .as_array()
             .unwrap();
         assert!(watchers.len() > 1);
-    }
-
-    #[test]
-    fn watched_globs_cover_resolver_configs() {
-        let globs = watched_globs();
-        assert!(globs.iter().any(|glob| glob == "**/tsconfig.json"));
-        assert!(globs.iter().any(|glob| glob == "**/go.mod"));
     }
 
     #[test]
