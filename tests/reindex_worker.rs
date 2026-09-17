@@ -1,28 +1,19 @@
 #![expect(clippy::unwrap_used, reason = "a test may abort on setup failure")]
-use std::borrow::Cow;
-use std::path::Path;
 use std::time::Duration;
 
 use meta_call_lsp::buffers::{BufferStore, OpenOutcome};
-use meta_call_lsp::index::{IndexSnapshot, SourceText};
+use meta_call_lsp::index::IndexSnapshot;
 use meta_call_lsp::position::Encoding;
-use meta_call_lsp::types::{DocUri, DocVersion};
+use meta_call_lsp::types::DocVersion;
 
-fn doc_uri(value: &str) -> DocUri {
-    DocUri::try_from(value).expect("document URI")
-}
+mod common;
+
+use common::{DiskSources, doc_uri};
+
 use meta_call_lsp::reindex::{ReindexReq, spawn_worker};
 use meta_call_lsp::{convert, handlers, index};
 
 const APP: &str = "def greet(name):\n    return name\n\n\nresult = greet(\"x\")\n";
-
-struct DiskSources;
-
-impl SourceText for DiskSources {
-    fn source(&self, path: &Path) -> Option<Cow<'_, str>> {
-        std::fs::read_to_string(path).ok().map(Cow::Owned)
-    }
-}
 
 fn workspace() -> (tempfile::TempDir, String) {
     let dir = tempfile::tempdir().unwrap();
