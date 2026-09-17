@@ -7,10 +7,6 @@ use meta_ast::model::{SourceRange, SymbolId};
 use super::IndexSnapshot;
 use crate::types::DocUri;
 
-fn file_for_uri<'a>(snapshot: &'a IndexSnapshot, uri: &DocUri) -> Option<&'a FileExtraction> {
-    snapshot.file_by_path(&uri.to_path()?)
-}
-
 fn contains_byte(range: &SourceRange, byte: usize) -> bool {
     if range.byte_end > range.byte_start {
         range.byte_start <= byte && byte < range.byte_end
@@ -44,8 +40,9 @@ pub fn symbol_at<'a>(
     uri: &DocUri,
     byte: usize,
 ) -> Option<&'a meta_ast::Symbol> {
-    let file = file_for_uri(snapshot, uri)?;
-    smallest_symbol_at(file, byte)
+    snapshot
+        .file_by_path(&uri.to_path()?)
+        .and_then(|file| smallest_symbol_at(file, byte))
 }
 
 /// Innermost unresolved reference at `byte`; the reference list is the authority, so unresolvable ones still match.

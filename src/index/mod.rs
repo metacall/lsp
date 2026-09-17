@@ -112,10 +112,6 @@ impl IndexSnapshot {
 
     pub fn content_hash(&self, path: &Path) -> Option<Fingerprint> {
         let index = self.file_index(path)?;
-        self.content_hash_at(index)
-    }
-
-    pub(crate) fn content_hash_at(&self, index: usize) -> Option<Fingerprint> {
         self.content_hashes.get(index).copied().flatten()
     }
 
