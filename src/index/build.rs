@@ -16,9 +16,8 @@ use crate::shards;
 use crate::types::DocVersion;
 
 /// Whether rebuilds write `.meta-ast` shards: off for tests, on for the server worker.
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub enum Persistence {
-    #[default]
     Disabled,
     Enabled,
 }
