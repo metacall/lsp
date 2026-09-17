@@ -175,7 +175,6 @@ fn finish_snapshot(
         extractions,
         graph,
         scope,
-        references,
         client_calls,
         diagnostics,
         by_path: maps.by_path,

@@ -334,10 +334,5 @@ mod tests {
             sites.len(),
             1,
             "a recursive call is a real use site: {sites:?}"
-        );
-        assert_eq!(
-            snapshot.references[0].source, snapshot.references[0].target,
-            "the engine records the recursive use as a self reference"
-        );
-    }
+        );    }
 }

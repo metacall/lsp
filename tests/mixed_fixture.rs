@@ -193,14 +193,6 @@ fn the_fold_keeps_one_entry_per_target_and_the_highest_confidence() {
     assert_eq!(call.target, multiply);
     assert_eq!(call.confidence, 0.6, "a unique global call");
 
-    let recorded: Vec<f32> = snapshot
-        .references
-        .iter()
-        .filter(|record| record.target == multiply && record.source == total)
-        .map(|record| record.confidence)
-        .collect();
-    assert_eq!(recorded, vec![1.0], "the local call resolves at 1.0");
-
     let folded = targets_of(&snapshot, total);
     assert!(
         folded.contains(&(multiply, 1.0)),

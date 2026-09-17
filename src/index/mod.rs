@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use meta_ast::deploy::client_call::ResolvedClientCall;
 use meta_ast::model::{FileId, SourceRange, SymbolId};
-use meta_ast::{CodeGraph, FileExtraction, Fingerprint, FlattenedScopeCache, ResolvedReference};
+use meta_ast::{CodeGraph, FileExtraction, Fingerprint, FlattenedScopeCache};
 
 use crate::types::DocVersion;
 
@@ -23,14 +23,13 @@ pub struct Occurrence {
     pub range: SourceRange,
 }
 
-/// Immutable query surface over one analysis pass. `references` holds one record
-/// per resolved use site; `client_calls` one per resolved metacall call site.
+/// Immutable query surface over one analysis pass. `client_calls` holds one record
+/// per resolved metacall call site; resolved use sites live in `records_by_ref`.
 /// Internal maps key on extraction index; `by_path` is the single path seam.
 pub struct IndexSnapshot {
     pub extractions: Vec<Arc<FileExtraction>>,
     pub graph: CodeGraph,
     pub scope: FlattenedScopeCache,
-    pub references: Vec<ResolvedReference>,
     pub client_calls: Vec<ResolvedClientCall>,
     pub diagnostics: Vec<meta_ast::Diagnostic>,
     by_path: HashMap<PathBuf, usize>,
