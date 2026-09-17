@@ -13,7 +13,7 @@ use lsp_types::{
 };
 
 use crate::position::Encoding;
-use crate::server::ids::{WATCHED_FILES_REGISTRATION, watched_files_request_id};
+use crate::server::ids::{self, WATCHED_FILES_REGISTRATION, watched_files_request_id};
 use crate::types::{DocUri, RootDir};
 
 /// Files whose contents shape engine resolver state for the process lifetime.
@@ -48,7 +48,7 @@ pub(crate) fn capabilities(encoding: Encoding) -> ServerCapabilities {
             ..Default::default()
         }),
         diagnostic_provider: Some(DiagnosticServerCapabilities::Options(DiagnosticOptions {
-            identifier: Some("meta-ast".to_string()),
+            identifier: Some(ids::DIAGNOSTIC_SOURCE.to_string()),
             inter_file_dependencies: false,
             workspace_diagnostics: false,
             work_done_progress_options: WorkDoneProgressOptions::default(),
