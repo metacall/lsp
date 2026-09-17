@@ -30,15 +30,10 @@ pub fn document_symbols(ctx: &mut QueryCtx, uri: &DocUri) -> Vec<DocumentSymbol>
     let Some(file) = ctx.document(uri) else {
         return Vec::new();
     };
-    let path = file.path.clone();
     file.symbols
         .iter()
         .map(|symbol| {
-            let range = ctx.range_for(&path, &symbol.source_range);
-            let selection_range = match &symbol.name_range {
-                Some(name_range) => ctx.range_for(&path, name_range),
-                None => range,
-            };
+            let (range, selection_range) = ctx.symbol_ranges(symbol);
             DocumentSymbol {
                 name: symbol.name.clone(),
                 detail: symbol.signature.clone(),

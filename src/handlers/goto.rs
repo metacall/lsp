@@ -34,11 +34,7 @@ pub fn definition_at(
             let Some(target_uri) = convert::path_to_uri(&symbol.file_path) else {
                 continue;
             };
-            let range = ctx.range_for(&symbol.file_path, &symbol.source_range);
-            let selection = match &symbol.name_range {
-                Some(name_range) => ctx.range_for(&symbol.file_path, name_range),
-                None => range,
-            };
+            let (range, selection) = ctx.symbol_ranges(symbol);
             let origin_selection_range = origin.map(|range| ctx.range_for(&source_path, range));
             links.push(LocationLink {
                 origin_selection_range,
