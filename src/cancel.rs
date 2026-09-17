@@ -9,10 +9,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use lsp_server::RequestId;
 
 #[derive(Clone, Default)]
-pub struct CancelToken(Arc<AtomicBool>);
+struct CancelToken(Arc<AtomicBool>);
 
 impl CancelToken {
-    pub fn is_cancelled(&self) -> bool {
+    fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::Relaxed)
     }
 
