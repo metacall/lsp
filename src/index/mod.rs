@@ -10,8 +10,8 @@ use meta_ast::{CodeGraph, FileExtraction, Fingerprint, FlattenedScopeCache, Reso
 
 use crate::types::DocVersion;
 
-pub mod build;
-pub mod query;
+mod build;
+mod query;
 
 pub use build::{Persistence, Reindexer, collect_inputs, rebuild_from_inputs};
 pub use query::{resolve_targets, symbol_at};
