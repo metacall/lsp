@@ -18,7 +18,7 @@ pub fn completion_kind(kind: meta_ast::SymbolKind) -> CompletionItemKind {
     kind_pair(kind).1
 }
 
-/// Display word for one engine symbol kind; kept beside `kind_pair` so the two cannot drift.
+/// Human word for one engine symbol kind; hover renders this, not the engine debug text.
 pub fn kind_word(kind: meta_ast::SymbolKind) -> &'static str {
     use meta_ast::SymbolKind as Engine;
     match kind {

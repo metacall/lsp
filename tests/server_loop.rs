@@ -44,7 +44,7 @@ fn notification(method: &str, params: Value) -> Message {
     })
 }
 
-/// Wait for one response and return its result or its error code.
+/// Wait for the response to `id`, skipping the progress and registration traffic around it.
 fn response_for(client: &Connection, id: i32) -> Result<Value, i32> {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
