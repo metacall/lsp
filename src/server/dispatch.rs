@@ -47,8 +47,14 @@ pub(crate) fn handle_request(
     };
     drop(registration);
     match outcome {
-        Ok(value) => respond(connection, id, value),
-        Err(error) => send_response_error(connection, id, &error),
+        Ok(value) => send(
+            connection,
+            Message::Response(Response {
+                id,
+                response_result: Ok(value),
+            }),
+        ),
+        Err(error) => send(connection, Message::Response(error.to_response(id))),
     }
 }
 
@@ -195,20 +201,6 @@ fn send(connection: &Connection, message: Message) {
     if let Err(error) = connection.sender.send(message) {
         tracing::warn!(%error, "send failed");
     }
-}
-
-fn respond(connection: &Connection, id: RequestId, value: serde_json::Value) {
-    send(
-        connection,
-        Message::Response(Response {
-            id,
-            response_result: Ok(value),
-        }),
-    );
-}
-
-pub(crate) fn send_response_error(connection: &Connection, id: RequestId, error: &ServerError) {
-    send(connection, Message::Response(error.to_response(id)));
 }
 
 fn document_uri(method: &str, uri: &lsp_types::Uri) -> Option<DocUri> {
