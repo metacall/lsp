@@ -200,15 +200,7 @@ mod tests {
     use crate::testutil::doc_uri;
 
     fn session(dir: &Path) -> Session {
-        let snapshot = crate::index::rebuild_from_inputs(dir, &[]).expect("rebuild");
-        let (req_tx, _req_rx) = crossbeam_channel::unbounded::<ReindexReq>();
-        Session::new(
-            crate::types::RootDir::try_from(dir).expect("root"),
-            Encoding::Utf16,
-            snapshot,
-            req_tx,
-            true,
-        )
+        crate::testutil::session(dir, true).0
     }
 
     fn session_with_file(dir: &Path) -> Session {

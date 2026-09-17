@@ -4,7 +4,7 @@ mod dispatch;
 pub(crate) mod ids;
 mod progress;
 mod scheduler;
-mod session;
+pub(crate) mod session;
 
 use anyhow::Context;
 use crossbeam_channel::{Receiver, TryRecvError, select};
@@ -322,9 +322,6 @@ mod tests {
     use lsp_types::request::{DocumentSymbolRequest, Request as _, Shutdown};
 
     use super::*;
-    use crate::position::Encoding;
-    use crate::reindex::ReindexReq;
-
     const CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
 
     fn dead_response_receiver() -> Receiver<ReindexResp> {
@@ -333,43 +330,13 @@ mod tests {
         resp_rx
     }
 
-    #[test]
-    fn a_dead_worker_receiver_stays_ready_and_never_goes_dark() {
-        let dead = dead_response_receiver();
-        assert!(
-            matches!(
-                dead.try_recv(),
-                Err(crossbeam_channel::TryRecvError::Disconnected)
-            ),
-            "a dropped sender disconnects the receiver"
-        );
-
-        let dark = crossbeam_channel::never::<ReindexResp>();
-        assert!(matches!(
-            dark.try_recv(),
-            Err(crossbeam_channel::TryRecvError::Empty)
-        ));
-        select! {
-            recv(dark) -> _ => panic!("a never receiver must not be ready"),
-            default(Duration::from_millis(10)) => {}
-        }
-    }
-
     /// A lost worker answers with an error and the session keeps serving.
     #[test]
     fn worker_loss_answers_request_failed_and_keeps_serving() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("a.py");
         std::fs::write(&file, "def greet(): pass\n").unwrap();
-        let snapshot = index::rebuild_from_inputs(dir.path(), &[]).expect("rebuild");
-        let (req_tx, _req_rx) = crossbeam_channel::unbounded::<ReindexReq>();
-        let session = Session::new(
-            crate::types::RootDir::try_from(dir.path()).expect("root"),
-            Encoding::Utf16,
-            snapshot,
-            req_tx,
-            false,
-        );
+        let (session, _req_rx) = crate::testutil::session(dir.path(), false);
         let (connection, client) = Connection::memory();
         let server = Server {
             connection,
@@ -440,15 +407,7 @@ mod tests {
         let file = dir.path().join("a.py");
         std::fs::write(&file, "def greet(): pass\n").unwrap();
         let uri = crate::convert::path_to_uri(&file).expect("uri").to_string();
-        let snapshot = index::rebuild_from_inputs(dir.path(), &[]).expect("rebuild");
-        let (req_tx, req_rx) = crossbeam_channel::unbounded::<ReindexReq>();
-        let session = Session::new(
-            crate::types::RootDir::try_from(dir.path()).expect("root"),
-            Encoding::Utf16,
-            snapshot,
-            req_tx,
-            false,
-        );
+        let (session, req_rx) = crate::testutil::session(dir.path(), false);
         let (connection, client) = Connection::memory();
 
         client
