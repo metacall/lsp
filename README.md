@@ -58,9 +58,9 @@ tests/      protocol tests and fixtures
 Toolchain: Rust 1.94.0, pinned in `rust-toolchain.toml`.
 
 ```bash
-cargo build --all-features
-cargo test --all-features
-cargo clippy --all-targets --all-features -- -D warnings
+cargo build
+cargo test
+cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
