@@ -7,14 +7,6 @@ description = "Polyglot language server over the meta-ast index"
 license = "Apache-2.0"
 repository = "https://github.com/metacall/lsp"
 
-[[bin]]
-name = "meta-call-lsp"
-path = "src/main.rs"
-
-[lib]
-name = "meta_call_lsp"
-path = "src/lib.rs"
-
 [dependencies]
 meta-ast = { version = "0.7.0", features = ["metacall-deploy"] }
 crossbeam-channel = "0.5"
