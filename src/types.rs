@@ -8,16 +8,23 @@ use crate::error::ServerError;
 
 /// One document address, parsed once at the boundary; `to_path` yields a path only for a file URI.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct DocUri(Url);
+pub struct DocUri {
+    url: Url,
+    path: Option<PathBuf>,
+}
 
 impl DocUri {
     pub fn as_str(&self) -> &str {
-        self.0.as_str()
+        self.url.as_str()
+    }
+
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
     }
 
     /// Path of a file URI. `None` for any other scheme.
     pub fn to_path(&self) -> Option<PathBuf> {
-        self.0.to_file_path().ok()
+        self.path.clone()
     }
 }
 
@@ -31,9 +38,11 @@ impl TryFrom<&str> for DocUri {
     type Error = ServerError;
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
-        Url::parse(value)
-            .map(Self)
-            .map_err(|error| ServerError::InvalidParams(format!("document URI {value}: {error}")))
+        let url = Url::parse(value).map_err(|error| {
+            ServerError::InvalidParams(format!("document URI {value}: {error}"))
+        })?;
+        let path = url.to_file_path().ok();
+        Ok(Self { url, path })
     }
 }
 
@@ -46,16 +55,18 @@ impl TryFrom<&lsp_types::Uri> for DocUri {
 }
 
 /// Document version the client sent; the buffer store keeps it strictly increasing.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct DocVersion(i32);
 
 impl DocVersion {
-    pub fn get(self) -> i32 {
+    pub fn value(self) -> i32 {
         self.0
     }
+}
 
-    pub fn is_newer_than(self, other: Self) -> bool {
-        self.0 > other.0
+impl From<DocVersion> for i32 {
+    fn from(version: DocVersion) -> Self {
+        version.0
     }
 }
 
@@ -75,7 +86,7 @@ impl RootDir {
     }
 
     pub fn contains(&self, path: &Path) -> bool {
-        path.starts_with(&self.0)
+        dunce::simplified(path).starts_with(&self.0)
     }
 }
 
@@ -114,10 +125,16 @@ impl LogLevel {
     }
 }
 
-impl TryFrom<&str> for LogLevel {
-    type Error = anyhow::Error;
+impl std::fmt::Display for LogLevel {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
 
-    fn try_from(value: &str) -> Result<Self, anyhow::Error> {
+impl std::str::FromStr for LogLevel {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "error" => Ok(LogLevel::Error),
             "warn" => Ok(LogLevel::Warn),
@@ -126,6 +143,14 @@ impl TryFrom<&str> for LogLevel {
             "trace" => Ok(LogLevel::Trace),
             other => anyhow::bail!("unknown log level {other:?}"),
         }
+    }
+}
+
+impl TryFrom<&str> for LogLevel {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &str) -> Result<Self, anyhow::Error> {
+        value.parse()
     }
 }
 

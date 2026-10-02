@@ -41,12 +41,15 @@ pub struct IndexSnapshot {
     occurrences: HashMap<SymbolId, Vec<Occurrence>>,
     content_hashes: Vec<Option<Fingerprint>>,
     versions: HashMap<PathBuf, DocVersion>,
+    diagnostics_by_path: HashMap<PathBuf, Vec<usize>>,
+    client_calls_by_site: HashMap<(usize, usize), Vec<usize>>,
 }
 
 impl IndexSnapshot {
     pub fn file_by_path(&self, path: &Path) -> Option<&FileExtraction> {
-        let &index = self.by_path.get(path)?;
-        self.extractions.get(index).map(Arc::as_ref)
+        self.extractions
+            .get(self.file_index(path)?)
+            .map(Arc::as_ref)
     }
 
     pub(crate) fn file_index(&self, path: &Path) -> Option<usize> {
@@ -63,7 +66,7 @@ impl IndexSnapshot {
         self.file_ids.get(index).copied().flatten()
     }
 
-    pub(crate) fn file_id_at(&self, index: usize) -> Option<FileId> {
+    pub(super) fn file_id_for_index(&self, index: usize) -> Option<FileId> {
         self.file_ids.get(index).copied().flatten()
     }
 
@@ -100,9 +103,10 @@ impl IndexSnapshot {
         path: &Path,
         range: &SourceRange,
     ) -> impl Iterator<Item = &'a ResolvedClientCall> {
-        self.client_calls.iter().filter(move |call| {
-            call.source_file == path && call.source_range.as_ref() == Some(range)
-        })
+        let key = self.file_index(path).map(|file| (file, range.byte_start));
+        key.into_iter()
+            .filter_map(|key| self.client_calls_by_site.get(&key))
+            .flat_map(|indices| indices.iter().filter_map(|&i| self.client_calls.get(i)))
     }
 
     /// Buffer version of the content the index holds; only open documents carry one.
@@ -115,8 +119,17 @@ impl IndexSnapshot {
         self.content_hashes.get(index).copied().flatten()
     }
 
-    pub fn version_map(&self) -> &HashMap<PathBuf, DocVersion> {
-        &self.versions
+    pub fn versions_match(&self, versions: &HashMap<PathBuf, DocVersion>) -> bool {
+        &self.versions == versions
+    }
+
+    pub fn diagnostics_for_path(&self, path: &Path) -> impl Iterator<Item = &meta_ast::Diagnostic> {
+        self.diagnostics_by_path
+            .get(path)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|&index| self.diagnostics.get(index))
     }
 
     /// Numeric generation of this pass; result ids embed it.

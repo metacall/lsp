@@ -102,9 +102,12 @@ fn compare_targets(snapshot: &IndexSnapshot, a: (SymbolId, f32), b: (SymbolId, f
 }
 
 /// Dedup by id keeping the highest confidence, then order by declaration site; sets are tiny, so a linear merge wins.
-fn dedup_targets(snapshot: &IndexSnapshot, targets: Vec<(SymbolId, f32)>) -> Vec<(SymbolId, f32)> {
+fn dedup_targets(snapshot: &IndexSnapshot, targets: &[(SymbolId, f32)]) -> Vec<(SymbolId, f32)> {
+    if targets.is_empty() {
+        return Vec::new();
+    }
     let mut merged: Vec<(SymbolId, f32)> = Vec::with_capacity(targets.len());
-    for (id, confidence) in targets {
+    for &(id, confidence) in targets {
         match merged.iter_mut().find(|(existing, _)| *existing == id) {
             Some((_, existing)) => *existing = existing.max(confidence),
             None => merged.push((id, confidence)),
@@ -122,7 +125,7 @@ pub(super) fn reference_targets(
 ) -> Vec<(SymbolId, f32)> {
     let recorded = snapshot.recorded_targets(file_index, reference.range.byte_start);
     if !recorded.is_empty() {
-        return dedup_targets(snapshot, recorded.to_vec());
+        return dedup_targets(snapshot, recorded);
     }
     scoped_targets(snapshot, file_index, &reference.name)
 }
@@ -140,15 +143,16 @@ pub(super) fn client_call_targets(
         .client_calls_at(path, range)
         .map(|call| (call.target, call.confidence))
         .collect();
-    dedup_targets(snapshot, targets)
+    dedup_targets(snapshot, &targets)
 }
 
 fn scoped_targets(snapshot: &IndexSnapshot, file_index: usize, name: &str) -> Vec<(SymbolId, f32)> {
-    let scoped: Vec<(SymbolId, f32)> = snapshot
-        .file_id_at(file_index)
+    let Some(scoped) = snapshot
+        .file_id_for_index(file_index)
         .and_then(|file_id| snapshot.scope.resolve(file_id, name))
-        .map(<[(SymbolId, f32)]>::to_vec)
-        .unwrap_or_default();
+    else {
+        return Vec::new();
+    };
     dedup_targets(snapshot, scoped)
 }
 
@@ -288,8 +292,7 @@ mod tests {
         let id_a = snapshot.file_by_path(&a).unwrap().symbols[0].id;
         let id_b = snapshot.file_by_path(&b).unwrap().symbols[0].id;
 
-        // The higher-scoring candidate is listed second; the path must win.
-        let ordered = dedup_targets(&snapshot, vec![(id_b, 1.0), (id_a, 0.6)]);
+        let ordered = dedup_targets(&snapshot, &[(id_b, 1.0), (id_a, 0.6)]);
 
         assert_eq!(ordered, vec![(id_a, 0.6), (id_b, 1.0)]);
     }
@@ -302,7 +305,7 @@ mod tests {
         let snapshot = rebuild_from_inputs(dir.path(), &[]).unwrap();
         let id = snapshot.file_by_path(&a).unwrap().symbols[0].id;
 
-        let ordered = dedup_targets(&snapshot, vec![(id, 0.6), (id, 1.0), (id, 0.8)]);
+        let ordered = dedup_targets(&snapshot, &[(id, 0.6), (id, 1.0), (id, 0.8)]);
 
         assert_eq!(ordered, vec![(id, 1.0)]);
     }

@@ -1,5 +1,7 @@
 //! Typed server errors.
-use lsp_server::{RequestId, Response, ResponseError};
+use std::any::Any;
+
+use lsp_server::{ErrorCode, RequestId, Response, ResponseError};
 
 /// Failure of one reindex pass.
 #[derive(Debug, thiserror::Error)]
@@ -10,14 +12,23 @@ pub enum ReindexError {
     /// The snapshot id space is exhausted; the pass cannot be recorded.
     #[error("snapshot counter exhausted")]
     Exhausted,
+    #[error("reindex worker panicked: {0}")]
+    Panicked(String),
 }
 
-const METHOD_NOT_FOUND: i32 = -32601;
-const INVALID_PARAMS: i32 = -32602;
-const INTERNAL_ERROR: i32 = -32603;
-const REQUEST_CANCELLED: i32 = -32800;
-const CONTENT_MODIFIED: i32 = -32801;
-const REQUEST_FAILED: i32 = -32803;
+pub(crate) fn panic_message(payload: Box<dyn Any + Send>) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .map(str::to_string)
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .or_else(|| {
+            payload
+                .downcast_ref::<Box<dyn std::error::Error + Send>>()
+                .map(|error| error.to_string())
+        })
+        .unwrap_or_else(|| "unknown panic payload".to_string())
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServerError {
@@ -38,14 +49,26 @@ pub enum ServerError {
 }
 
 impl ServerError {
+    pub fn not_indexed(uri: &crate::types::DocUri) -> Self {
+        Self::RequestFailed(format!("document is not indexed: {uri}"))
+    }
+
+    pub fn unavailable(reason: impl Into<String>) -> Self {
+        Self::RequestFailed(format!("index unavailable: {}", reason.into()))
+    }
+
+    pub fn outside_root(uri: &crate::types::DocUri) -> Self {
+        Self::RequestFailed(format!("document is outside the indexed root: {uri}"))
+    }
+
     pub fn to_response(&self, id: RequestId) -> Response {
         let code = match self {
-            ServerError::MethodNotFound(_) => METHOD_NOT_FOUND,
-            ServerError::InvalidParams(_) => INVALID_PARAMS,
-            ServerError::Internal(_) => INTERNAL_ERROR,
-            ServerError::Cancelled => REQUEST_CANCELLED,
-            ServerError::ContentModified(_) => CONTENT_MODIFIED,
-            ServerError::RequestFailed(_) => REQUEST_FAILED,
+            ServerError::MethodNotFound(_) => ErrorCode::MethodNotFound as i32,
+            ServerError::InvalidParams(_) => ErrorCode::InvalidParams as i32,
+            ServerError::Internal(_) => ErrorCode::InternalError as i32,
+            ServerError::Cancelled => ErrorCode::RequestCanceled as i32,
+            ServerError::ContentModified(_) => ErrorCode::ContentModified as i32,
+            ServerError::RequestFailed(_) => ErrorCode::RequestFailed as i32,
         };
         Response {
             id,
