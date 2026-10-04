@@ -17,9 +17,7 @@ pub fn definition_at(
     pos: Position,
     link_support: bool,
 ) -> Option<GotoDefinitionResponse> {
-    let file = ctx.document(uri)?;
-    let byte = ctx.byte_at(&file.path, pos)?;
-    let source_path = file.path.clone();
+    let (source_path, byte) = ctx.cursor(uri, pos)?;
     let targets = index::resolve_targets(ctx.snapshot(), uri, byte);
     if targets.is_empty() {
         return None;
@@ -35,9 +33,8 @@ pub fn definition_at(
                 continue;
             };
             let (range, selection) = ctx.symbol_ranges(symbol);
-            let origin_selection_range = origin.map(|range| ctx.range_for(&source_path, range));
             links.push(LocationLink {
-                origin_selection_range,
+                origin_selection_range: origin.map(|range| ctx.range_for(&source_path, range)),
                 target_uri,
                 target_range: range,
                 target_selection_range: selection,
@@ -61,7 +58,12 @@ pub fn definition_at(
 struct ReferenceSite {
     path: PathBuf,
     byte: usize,
-    location: Location,
+    site: Site,
+}
+
+enum Site {
+    Decl(meta_ast::model::SymbolId),
+    Use(meta_ast::model::SourceRange),
 }
 
 pub fn references_at(
@@ -70,10 +72,7 @@ pub fn references_at(
     pos: Position,
     include_declaration: bool,
 ) -> Vec<Location> {
-    let Some(file) = ctx.document(uri) else {
-        return Vec::new();
-    };
-    let Some(byte) = ctx.byte_at(&file.path, pos) else {
+    let Some((_, byte)) = ctx.cursor(uri, pos) else {
         return Vec::new();
     };
     let targets = index::resolve_targets(ctx.snapshot(), uri, byte);
@@ -84,45 +83,64 @@ pub fn references_at(
     let mut declarations = Vec::new();
     let mut sites = Vec::new();
     for (id, _) in targets {
-        if include_declaration
-            && let Some(symbol) = ctx.snapshot().symbol_by_id(id)
-            && let Some(location) = ctx.location(symbol)
-        {
+        if include_declaration && let Some(symbol) = ctx.snapshot().symbol_by_id(id) {
             declarations.push(ReferenceSite {
                 path: symbol.file_path.clone(),
                 byte: symbol.source_range.byte_start,
-                location,
+                site: Site::Decl(id),
             });
         }
         for occurrence in ctx.snapshot().occurrences_of(id) {
             let Some(path) = ctx.snapshot().path_of(occurrence.file) else {
                 continue;
             };
-            let Some(owner_uri) = convert::path_to_uri(path) else {
-                continue;
-            };
-            let location = Location {
-                uri: owner_uri,
-                range: ctx.range_for(path, &occurrence.range),
-            };
             sites.push(ReferenceSite {
                 path: path.to_path_buf(),
                 byte: occurrence.range.byte_start,
-                location,
+                site: Site::Use(occurrence.range.clone()),
             });
         }
     }
 
     order_sites(&mut declarations);
     order_sites(&mut sites);
-    let mut locations: Vec<Location> = declarations.into_iter().map(|site| site.location).collect();
-    locations.extend(sites.into_iter().map(|site| site.location));
-    locations.truncate(CAP_REFERENCES);
+    declarations.extend(sites);
+    if declarations.len() > CAP_REFERENCES {
+        tracing::debug!(
+            total = declarations.len(),
+            cap = CAP_REFERENCES,
+            "references truncated"
+        );
+        declarations.truncate(CAP_REFERENCES);
+    }
+
+    let mut locations = Vec::with_capacity(declarations.len());
+    for site in declarations {
+        match site.site {
+            Site::Decl(id) => {
+                let Some(symbol) = ctx.snapshot().symbol_by_id(id) else {
+                    continue;
+                };
+                if let Some(location) = ctx.location(symbol) {
+                    locations.push(location);
+                }
+            }
+            Site::Use(range) => {
+                let Some(owner_uri) = convert::path_to_uri(&site.path) else {
+                    continue;
+                };
+                locations.push(Location {
+                    uri: owner_uri,
+                    range: ctx.range_for(&site.path, &range),
+                });
+            }
+        }
+    }
     locations
 }
 
 fn order_sites(sites: &mut Vec<ReferenceSite>) {
-    sites.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.byte.cmp(&b.byte)));
+    sites.sort_unstable_by(|a, b| a.path.cmp(&b.path).then_with(|| a.byte.cmp(&b.byte)));
     sites.dedup_by(|a, b| a.path == b.path && a.byte == b.byte);
 }
 
@@ -134,10 +152,7 @@ mod tests {
         ReferenceSite {
             path: PathBuf::from(path),
             byte,
-            location: Location {
-                uri: "file:///a.py".parse().unwrap(),
-                range: lsp_types::Range::default(),
-            },
+            site: Site::Decl(meta_ast::model::SymbolId::new(1).unwrap()),
         }
     }
 

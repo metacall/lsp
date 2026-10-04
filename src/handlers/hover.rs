@@ -7,8 +7,7 @@ use crate::index;
 use crate::types::DocUri;
 
 pub fn hover_at(ctx: &mut QueryCtx, uri: &DocUri, pos: Position) -> Option<Hover> {
-    let file = ctx.document(uri)?;
-    let byte = ctx.byte_at(&file.path, pos)?;
+    let (path, byte) = ctx.cursor(uri, pos)?;
     let symbol = index::symbol_at(ctx.snapshot(), uri, byte)?;
     let mut value = format!(
         "**{}** ({})\n\n```{}\n{}\n```",
@@ -21,7 +20,7 @@ pub fn hover_at(ctx: &mut QueryCtx, uri: &DocUri, pos: Position) -> Option<Hover
         value.push_str("\n\n");
         value.push_str(docstring);
     }
-    let range = ctx.range_for(&file.path, &symbol.source_range);
+    let range = ctx.range_for(&path, &symbol.source_range);
     Some(Hover {
         contents: HoverContents::Markup(MarkupContent {
             kind: MarkupKind::Markdown,

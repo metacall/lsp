@@ -2,16 +2,26 @@
 use super::QueryCtx;
 use crate::types::DocUri;
 
+const CAP_DIAGNOSTICS: usize = 500;
+
 pub fn diagnostics_for(ctx: &mut QueryCtx, uri: &DocUri) -> Vec<lsp_types::Diagnostic> {
     let Some(path) = uri.to_path() else {
         return Vec::new();
     };
-    ctx.snapshot()
-        .diagnostics
-        .iter()
-        .filter(|diagnostic| diagnostic.path == path)
+    let mut items: Vec<lsp_types::Diagnostic> = ctx
+        .snapshot()
+        .diagnostics_for_path(&path)
         .map(|diagnostic| ctx.diagnostic(diagnostic))
-        .collect()
+        .collect();
+    if items.len() > CAP_DIAGNOSTICS {
+        tracing::debug!(
+            total = items.len(),
+            cap = CAP_DIAGNOSTICS,
+            "diagnostics truncated"
+        );
+        items.truncate(CAP_DIAGNOSTICS);
+    }
+    items
 }
 
 #[cfg(test)]

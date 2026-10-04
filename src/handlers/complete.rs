@@ -33,21 +33,15 @@ struct Candidate {
 
 /// Names visible from the cursor, ordered by tier and then by name and site.
 pub fn completion_at(ctx: &mut QueryCtx, uri: &DocUri, pos: Position) -> Vec<CompletionItem> {
-    let Some(file) = ctx.document(uri) else {
+    let Some((path, byte)) = ctx.cursor(uri, pos) else {
         return Vec::new();
     };
-    let Some(byte) = ctx.byte_at(&file.path, pos) else {
+    let Some(prefix) = ctx.text(&path).map(|text| identifier_prefix(text, byte)) else {
         return Vec::new();
     };
-    let raw_prefix = {
-        let Some(text) = ctx.text(&file.path) else {
-            return Vec::new();
-        };
-        identifier_prefix(text, byte)
-    };
-    let prefix = Prefix::new(&raw_prefix);
+    let prefix = Prefix::new(&prefix);
     let snapshot = ctx.snapshot();
-    let Some(file_id) = snapshot.file_id(&file.path) else {
+    let Some(file_id) = snapshot.file_id(&path) else {
         return Vec::new();
     };
     let Some(scope) = snapshot.scope.scope(file_id) else {
@@ -57,28 +51,34 @@ pub fn completion_at(ctx: &mut QueryCtx, uri: &DocUri, pos: Position) -> Vec<Com
     let mut seen = HashSet::new();
     let mut candidates = Vec::new();
     for case_sensitive in [true, false] {
-        collect_scope_completions(
-            snapshot,
-            scope,
-            &prefix,
-            case_sensitive,
-            &mut seen,
-            &mut candidates,
-        );
+        for (name, scoped) in scope {
+            if !prefix.matches(name, case_sensitive) {
+                continue;
+            }
+            for (id, confidence) in scoped {
+                push_candidate(&mut candidates, &mut seen, snapshot, name, *id, *confidence);
+            }
+        }
         if let Some(enclosing) = index::symbol_at(snapshot, uri, byte) {
-            collect_reference_completions(
-                snapshot,
-                snapshot.references_out(enclosing.id),
-                &prefix,
-                case_sensitive,
-                &mut seen,
-                &mut candidates,
-            );
+            for (id, confidence) in snapshot.references_out(enclosing.id) {
+                let Some(symbol) = snapshot.symbol_by_id(*id) else {
+                    continue;
+                };
+                if prefix.matches(&symbol.name, case_sensitive) {
+                    push_candidate(
+                        &mut candidates,
+                        &mut seen,
+                        snapshot,
+                        &symbol.name,
+                        *id,
+                        *confidence,
+                    );
+                }
+            }
         }
         if !candidates.is_empty() || !case_sensitive {
             break;
         }
-        seen.clear();
     }
 
     candidates.sort_by(|a, b| {
@@ -114,46 +114,12 @@ impl<'a> Prefix<'a> {
             return true;
         }
         if case_sensitive {
-            name.starts_with(self.raw)
-        } else {
-            name.to_lowercase().starts_with(&self.folded)
+            return name.starts_with(self.raw);
         }
-    }
-}
-
-fn collect_scope_completions(
-    snapshot: &index::IndexSnapshot,
-    scope: &meta_ast::ScopeMap,
-    prefix: &Prefix<'_>,
-    case_sensitive: bool,
-    seen: &mut HashSet<meta_ast::model::SymbolId>,
-    candidates: &mut Vec<Candidate>,
-) {
-    for (name, scoped) in scope {
-        if !prefix.matches(name, case_sensitive) {
-            continue;
+        if self.raw.is_ascii() && name.len() >= self.raw.len() {
+            return name.as_bytes()[..self.raw.len()].eq_ignore_ascii_case(self.raw.as_bytes());
         }
-        for (id, confidence) in scoped {
-            push_candidate(candidates, seen, snapshot, name, *id, *confidence);
-        }
-    }
-}
-
-fn collect_reference_completions(
-    snapshot: &index::IndexSnapshot,
-    references: &[(meta_ast::model::SymbolId, f32)],
-    prefix: &Prefix<'_>,
-    case_sensitive: bool,
-    seen: &mut HashSet<meta_ast::model::SymbolId>,
-    candidates: &mut Vec<Candidate>,
-) {
-    for (id, confidence) in references {
-        let Some(symbol) = snapshot.symbol_by_id(*id) else {
-            continue;
-        };
-        if prefix.matches(&symbol.name, case_sensitive) {
-            push_candidate(candidates, seen, snapshot, &symbol.name, *id, *confidence);
-        }
+        name.to_lowercase().starts_with(&self.folded)
     }
 }
 
@@ -182,14 +148,20 @@ fn push_candidate(
             label: name.to_string(),
             kind: Some(convert::completion_kind(symbol.kind)),
             detail: symbol.signature.clone(),
-            filter_text: Some(name.to_string()),
-            sort_text: Some(format!("{tier}{name}")),
+            sort_text: Some(format!("{tier:02}-{name}")),
             ..Default::default()
         },
     });
 }
 
 fn identifier_prefix(text: &str, byte: usize) -> String {
+    let mut byte = byte.min(text.len());
+    while !text.is_char_boundary(byte) && byte > 0 {
+        byte -= 1;
+    }
+    if !text.is_char_boundary(byte) {
+        return String::new();
+    }
     let mut start = byte;
     for (index, ch) in text[..byte].char_indices().rev() {
         if ch.is_alphanumeric() || ch == '_' {
