@@ -1,5 +1,6 @@
 //! Canonical transport identifiers: one spelling per concern.
 use lsp_server::RequestId;
+use lsp_types::NumberOrString;
 
 pub(crate) const SERVER_NAME: &str = "meta-call-lsp";
 
@@ -12,10 +13,21 @@ pub(crate) fn watched_files_request_id() -> RequestId {
     RequestId::from("meta-call-lsp-register-watched-files".to_string())
 }
 
-pub(crate) fn reindex_progress_token(number: u64) -> String {
-    format!("{SERVER_NAME}-reindex-{number}")
+pub(crate) struct ProgressId(pub u64);
+
+impl ProgressId {
+    pub(crate) fn token(self) -> NumberOrString {
+        NumberOrString::String(format!("{SERVER_NAME}-reindex-{}", self.0))
+    }
+
+    pub(crate) fn ack(self) -> RequestId {
+        RequestId::from(format!("{SERVER_NAME}-progress-{}", self.0))
+    }
 }
 
-pub(crate) fn reindex_progress_ack(number: u64) -> RequestId {
-    RequestId::from(format!("{SERVER_NAME}-progress-{number}"))
+impl Copy for ProgressId {}
+impl Clone for ProgressId {
+    fn clone(&self) -> Self {
+        *self
+    }
 }

@@ -41,17 +41,16 @@ pub(super) fn hex(bytes: &[u8]) -> String {
 
 /// Write through a temp file with fsync, then rename into place.
 pub(super) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let file_name = path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let tmp = path.with_file_name(format!("{file_name}.tmp"));
-    {
-        let mut file = fs::File::create(&tmp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-    }
-    fs::rename(&tmp, path)?;
+    let Some(parent) = path.parent() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "shard path has no parent",
+        ));
+    };
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    tmp.write_all(bytes)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path).map_err(|error| error.error)?;
     sync_dir(path);
     Ok(())
 }
@@ -60,8 +59,9 @@ pub(super) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 fn sync_dir(path: &Path) {
     if let Some(parent) = path.parent()
         && let Ok(dir) = fs::File::open(parent)
+        && let Err(error) = dir.sync_all()
     {
-        let _ = dir.sync_all();
+        tracing::trace!(path = %path.display(), %error, "directory sync failed");
     }
 }
 
@@ -69,6 +69,10 @@ pub(super) fn timestamp() -> String {
     let seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs());
+    format_timestamp(seconds)
+}
+
+fn format_timestamp(seconds: u64) -> String {
     let days = (seconds / 86_400) as i64;
     let clock = seconds % 86_400;
     let (year, month, day) = civil_from_days(days);

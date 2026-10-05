@@ -1,6 +1,6 @@
 //! One served workspace: documents, index state, batching, progress.
 use std::borrow::Cow;
-use std::collections::BTreeSet;
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -16,11 +16,10 @@ use crate::server::progress::ProgressTracker;
 use crate::server::scheduler::Scheduler;
 use crate::types::{DocUri, RootDir};
 
-/// Buffers win over disk; disk text is used only when it matches the snapshot fingerprint.
 impl SourceText for Session {
     fn source(&self, path: &Path) -> Option<Cow<'_, str>> {
         if let Some(doc) = self.buffers.by_path(path) {
-            return Some(Cow::Borrowed(doc.text.as_str()));
+            return Some(Cow::Borrowed(doc.text.as_ref()));
         }
         let IndexState::Ready(snapshot) = &self.index else {
             return None;
@@ -46,12 +45,11 @@ pub(crate) struct Session {
     pub(crate) encoding: Encoding,
     pub(crate) definition_links: bool,
     pub(crate) buffers: BufferStore,
-    pub(crate) warned_resolvers: BTreeSet<String>,
+    pub(crate) warned_resolvers: HashSet<String>,
     index: IndexState,
     pub(crate) applied_seq: u64,
     scheduler: Scheduler,
     pub(crate) progress: ProgressTracker,
-    /// True when workspace state changed and no request carries it yet.
     dirty: bool,
 }
 
@@ -68,7 +66,7 @@ impl Session {
             encoding,
             definition_links: false,
             buffers: BufferStore::default(),
-            warned_resolvers: BTreeSet::new(),
+            warned_resolvers: HashSet::new(),
             index: IndexState::Ready(snapshot),
             applied_seq: 0,
             scheduler: Scheduler::new(req_tx),
@@ -80,39 +78,30 @@ impl Session {
     pub(crate) fn ready(&self) -> Result<&Arc<IndexSnapshot>, ServerError> {
         match &self.index {
             IndexState::Ready(snapshot) => Ok(snapshot),
-            IndexState::Unavailable { reason } => Err(ServerError::RequestFailed(format!(
-                "index unavailable: {reason}"
-            ))),
+            IndexState::Unavailable { reason } => Err(ServerError::unavailable(reason)),
         }
     }
 
-    /// An open document must be indexable and at the exact version the client sent.
     pub(crate) fn ready_for(&self, uri: &DocUri) -> Result<&Arc<IndexSnapshot>, ServerError> {
         let snapshot = self.ready()?;
         let Some(path) = uri.to_path() else {
-            return Err(ServerError::RequestFailed(format!(
-                "document is not indexed: {uri}"
-            )));
+            return Err(ServerError::not_indexed(uri));
         };
         if let Some(doc) = self.buffers.get(uri) {
             if !self.indexable(uri) {
-                return Err(ServerError::RequestFailed(format!(
-                    "document is outside the indexed root: {uri}"
-                )));
+                return Err(ServerError::outside_root(uri));
             }
             if snapshot.document_version(&path) != Some(doc.version) {
                 return Err(ServerError::ContentModified(format!(
                     "{uri} at version {} was not indexed by snapshot {}",
-                    doc.version.get(),
+                    doc.version.value(),
                     snapshot.generation()
                 )));
             }
             return Ok(snapshot);
         }
         if snapshot.file_by_path(&path).is_none() {
-            return Err(ServerError::RequestFailed(format!(
-                "document is not indexed: {uri}"
-            )));
+            return Err(ServerError::not_indexed(uri));
         }
         Ok(snapshot)
     }
@@ -144,6 +133,7 @@ impl Session {
                 tracing::info!(
                     seq = resp.seq,
                     elapsed_ms = resp.elapsed_ms,
+                    coalesced = resp.coalesced,
                     "snapshot swap"
                 );
                 self.index = IndexState::Ready(snapshot);
@@ -155,6 +145,9 @@ impl Session {
                     }
                     ReindexError::Exhausted => {
                         tracing::error!("snapshot counter exhausted; index unavailable")
+                    }
+                    ReindexError::Panicked(message) => {
+                        tracing::error!(%message, "reindex worker panicked; index unavailable")
                     }
                 }
                 self.index = IndexState::Unavailable {
@@ -171,7 +164,7 @@ impl Session {
         self.index = IndexState::Unavailable {
             reason: "reindex worker gone".to_string(),
         };
-        self.progress.abandon(connection);
+        self.progress.close(connection);
     }
 
     /// A save only marks the workspace dirty; the worker compares fingerprints.
@@ -301,6 +294,7 @@ mod tests {
             ReindexResp {
                 seq: 2,
                 elapsed_ms: 4,
+                coalesced: 0,
                 result: Err(ReindexError::Exhausted),
             },
         );
@@ -321,6 +315,7 @@ mod tests {
             ReindexResp {
                 seq: 3,
                 elapsed_ms: 1,
+                coalesced: 0,
                 result: Err(ReindexError::Exhausted),
             },
         );

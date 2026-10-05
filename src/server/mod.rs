@@ -101,15 +101,13 @@ impl Server<Uninitialized> {
             .capabilities
             .window
             .as_ref()
-            .and_then(|window| window.work_done_progress)
-            .unwrap_or(false);
+            .is_some_and(|window| window.work_done_progress.unwrap_or(false));
         let definition_links = params
             .capabilities
             .text_document
             .as_ref()
             .and_then(|text_document| text_document.definition.as_ref())
-            .and_then(|definition| definition.link_support)
-            .unwrap_or(false);
+            .is_some_and(|definition| definition.link_support.unwrap_or(false));
         self.connection
             .initialize_finish(
                 request_id,
@@ -205,13 +203,18 @@ impl Server<Ready> {
             session.flush_batch();
             session.progress.pump(&connection);
         }
-        session.progress.abandon(&connection);
+        session.progress.close(&connection);
         drop(session);
-        if worker.join().is_err() {
-            return Err(anyhow::anyhow!("reindex worker panicked"));
+        let start = std::time::Instant::now();
+        match worker.join() {
+            Ok(()) => {}
+            Err(payload) => {
+                let message = crate::error::panic_message(payload);
+                return Err(anyhow::anyhow!("reindex worker panicked: {message}"));
+            }
         }
+        tracing::debug!(elapsed_ms = start.elapsed().as_millis(), "worker joined");
         if !shutdown {
-            // Spec: exit before shutdown is an error exit.
             return Err(anyhow::anyhow!("client exited without shutdown"));
         }
         Ok(())
@@ -246,18 +249,23 @@ fn drain_messages(
     cancel: &Cancellation,
     shutdown: &mut bool,
 ) -> anyhow::Result<LoopControl> {
-    loop {
+    const MAX_DRAIN: usize = 128;
+    for drained in 0..MAX_DRAIN {
         match connection.receiver.try_recv() {
             Ok(message) => {
                 match handle_client_message(connection, session, cancel, shutdown, message)? {
                     LoopControl::Continue => {}
                     LoopControl::Exit => return Ok(LoopControl::Exit),
                 }
+                if drained + 1 == MAX_DRAIN {
+                    tracing::debug!(cap = MAX_DRAIN, "drain cap hit");
+                }
             }
             Err(TryRecvError::Empty) => return Ok(LoopControl::Continue),
             Err(TryRecvError::Disconnected) => return Ok(LoopControl::Exit),
         }
     }
+    Ok(LoopControl::Continue)
 }
 
 fn handle_client_message(
@@ -302,7 +310,6 @@ fn handle_client_message(
                 return Ok(LoopControl::Exit);
             }
             handle_notification(connection, session, cancel, notification);
-            session.progress.pump(connection);
             Ok(LoopControl::Continue)
         }
         Message::Response(response) => {

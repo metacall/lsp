@@ -39,11 +39,12 @@ pub(crate) fn handle_request(
     request: WireRequest,
 ) {
     let WireRequest { id, method, params } = request;
-    let registration = cancel.register(&id);
+    let registration = cancel.register(id.clone());
     let outcome = if registration.is_cancelled() {
         Err(ServerError::Cancelled)
     } else {
-        catch_internal(|| dispatch_request(session, &method, params))
+        let cancelled = || registration.is_cancelled();
+        catch_internal(|| dispatch_request(session, &method, params, &cancelled))
     };
     drop(registration);
     match outcome {
@@ -65,11 +66,7 @@ fn catch_internal(
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(handle)) {
         Ok(outcome) => outcome,
         Err(payload) => {
-            let message = payload
-                .downcast_ref::<&str>()
-                .map(|message| (*message).to_string())
-                .or_else(|| payload.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "unknown panic payload".to_string());
+            let message = crate::error::panic_message(payload);
             tracing::error!(%message, "request handler panicked");
             Err(ServerError::Internal(format!(
                 "request handler panicked: {message}"
@@ -82,73 +79,92 @@ fn dispatch_request(
     session: &Session,
     method: &str,
     params: serde_json::Value,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<serde_json::Value, ServerError> {
-    if method == DocumentSymbolRequest::METHOD {
-        let params: DocumentSymbolParams = parse_params(params)?;
-        let uri = DocUri::try_from(&params.text_document.uri)?;
-        query_document(session, &uri, |ctx| {
-            DocumentSymbolResponse::Nested(handlers::document_symbols(ctx, &uri))
-        })
-    } else if method == HoverRequest::METHOD {
-        let params: HoverParams = parse_params(params)?;
-        let position = params.text_document_position_params.position;
-        let uri = DocUri::try_from(&params.text_document_position_params.text_document.uri)?;
-        query_document(session, &uri, |ctx| handlers::hover_at(ctx, &uri, position))
-    } else if method == GotoDefinition::METHOD {
-        let params: GotoDefinitionParams = parse_params(params)?;
-        let position = params.text_document_position_params.position;
-        let uri = DocUri::try_from(&params.text_document_position_params.text_document.uri)?;
-        query_document(session, &uri, |ctx| {
-            handlers::definition_at(ctx, &uri, position, session.definition_links)
-        })
-    } else if method == References::METHOD {
-        let params: ReferenceParams = parse_params(params)?;
-        let position = params.text_document_position.position;
-        let uri = DocUri::try_from(&params.text_document_position.text_document.uri)?;
-        query_document(session, &uri, |ctx| {
-            handlers::references_at(ctx, &uri, position, params.context.include_declaration)
-        })
-    } else if method == WorkspaceSymbolRequest::METHOD {
-        let params: WorkspaceSymbolParams = parse_params(params)?;
-        let snapshot = session.ready()?;
-        let mut ctx = QueryCtx::new(snapshot, session, session.encoding);
-        let symbols = handlers::workspace_symbols(&mut ctx, params.query.as_str());
-        to_value(WorkspaceSymbolResponse::Nested(symbols))
-    } else if method == Completion::METHOD {
-        let params: CompletionParams = parse_params(params)?;
-        let position = params.text_document_position.position;
-        let uri = DocUri::try_from(&params.text_document_position.text_document.uri)?;
-        query_document(session, &uri, |ctx| {
-            CompletionResponse::Array(handlers::completion_at(ctx, &uri, position))
-        })
-    } else if method == DocumentDiagnosticRequest::METHOD {
-        let params: DocumentDiagnosticParams = parse_params(params)?;
-        let uri = DocUri::try_from(&params.text_document.uri)?;
-        let snapshot = session.ready_for(&uri)?;
-        let result_id = diagnostic_result_id(snapshot, &uri);
-        if params.previous_result_id.as_deref() == Some(result_id.as_str()) {
-            return to_value(DocumentDiagnosticReportResult::Report(
-                DocumentDiagnosticReport::Unchanged(RelatedUnchangedDocumentDiagnosticReport {
+    match method {
+        DocumentSymbolRequest::METHOD => {
+            let params: DocumentSymbolParams = parse_params(params)?;
+            let uri = DocUri::try_from(&params.text_document.uri)?;
+            query_document(session, &uri, |ctx| {
+                DocumentSymbolResponse::Nested(handlers::document_symbols(ctx, &uri))
+            })
+        }
+        HoverRequest::METHOD => {
+            let params: HoverParams = parse_params(params)?;
+            let position = params.text_document_position_params.position;
+            let uri = DocUri::try_from(&params.text_document_position_params.text_document.uri)?;
+            query_document(session, &uri, |ctx| handlers::hover_at(ctx, &uri, position))
+        }
+        GotoDefinition::METHOD => {
+            let params: GotoDefinitionParams = parse_params(params)?;
+            let position = params.text_document_position_params.position;
+            let uri = DocUri::try_from(&params.text_document_position_params.text_document.uri)?;
+            query_document(session, &uri, |ctx| {
+                handlers::definition_at(ctx, &uri, position, session.definition_links)
+            })
+        }
+        References::METHOD => {
+            let params: ReferenceParams = parse_params(params)?;
+            let position = params.text_document_position.position;
+            let uri = DocUri::try_from(&params.text_document_position.text_document.uri)?;
+            query_document(session, &uri, |ctx| {
+                handlers::references_at(ctx, &uri, position, params.context.include_declaration)
+            })
+        }
+        WorkspaceSymbolRequest::METHOD => {
+            let params: WorkspaceSymbolParams = parse_params(params)?;
+            let snapshot = session.ready()?;
+            let mut ctx = QueryCtx::new(snapshot, session, session.encoding);
+            let symbols = handlers::workspace_symbols(&mut ctx, params.query.as_str(), cancelled);
+            if cancelled() {
+                return Err(ServerError::Cancelled);
+            }
+            to_value(WorkspaceSymbolResponse::Nested(symbols))
+        }
+        Completion::METHOD => {
+            let params: CompletionParams = parse_params(params)?;
+            let position = params.text_document_position.position;
+            let uri = DocUri::try_from(&params.text_document_position.text_document.uri)?;
+            query_document(session, &uri, |ctx| {
+                let items = handlers::completion_at(ctx, &uri, position);
+                let is_incomplete = items.len() >= 1000;
+                if is_incomplete {
+                    tracing::debug!(total = items.len(), "completion truncated");
+                }
+                CompletionResponse::List(lsp_types::CompletionList {
+                    is_incomplete,
+                    items,
+                })
+            })
+        }
+        DocumentDiagnosticRequest::METHOD => {
+            let params: DocumentDiagnosticParams = parse_params(params)?;
+            let uri = DocUri::try_from(&params.text_document.uri)?;
+            let snapshot = session.ready_for(&uri)?;
+            let result_id = diagnostic_result_id(snapshot, &uri);
+            if params.previous_result_id.as_deref() == Some(result_id.as_str()) {
+                return to_value(DocumentDiagnosticReportResult::Report(
+                    DocumentDiagnosticReport::Unchanged(RelatedUnchangedDocumentDiagnosticReport {
+                        related_documents: None,
+                        unchanged_document_diagnostic_report: UnchangedDocumentDiagnosticReport {
+                            result_id,
+                        },
+                    }),
+                ));
+            }
+            let mut ctx = QueryCtx::new(snapshot, session, session.encoding);
+            let items = handlers::diagnostics_for(&mut ctx, &uri);
+            to_value(DocumentDiagnosticReportResult::Report(
+                DocumentDiagnosticReport::Full(RelatedFullDocumentDiagnosticReport {
                     related_documents: None,
-                    unchanged_document_diagnostic_report: UnchangedDocumentDiagnosticReport {
-                        result_id,
+                    full_document_diagnostic_report: FullDocumentDiagnosticReport {
+                        result_id: Some(result_id),
+                        items,
                     },
                 }),
-            ));
+            ))
         }
-        let mut ctx = QueryCtx::new(snapshot, session, session.encoding);
-        let items = handlers::diagnostics_for(&mut ctx, &uri);
-        to_value(DocumentDiagnosticReportResult::Report(
-            DocumentDiagnosticReport::Full(RelatedFullDocumentDiagnosticReport {
-                related_documents: None,
-                full_document_diagnostic_report: FullDocumentDiagnosticReport {
-                    result_id: Some(result_id),
-                    items,
-                },
-            }),
-        ))
-    } else {
-        Err(ServerError::MethodNotFound(method.to_string()))
+        _ => Err(ServerError::MethodNotFound(method.to_string())),
     }
 }
 
@@ -173,7 +189,7 @@ fn diagnostic_result_id(snapshot: &crate::index::IndexSnapshot, uri: &DocUri) ->
         Some(version) => format!(
             "{DIAGNOSTIC_SOURCE}:{}:{}",
             snapshot.generation(),
-            version.get()
+            version.value()
         ),
         None => format!("{DIAGNOSTIC_SOURCE}:{}", snapshot.generation()),
     }
@@ -221,78 +237,91 @@ pub(crate) fn handle_notification(
     notification: WireNotification,
 ) {
     let WireNotification { method, params } = notification;
-    if method == DidOpenTextDocument::METHOD {
-        let Some(params) = notification_params::<DidOpenTextDocumentParams>(&method, params) else {
-            return;
-        };
-        let Some(uri) = document_uri(&method, &params.text_document.uri) else {
-            return;
-        };
-        if session.buffers.open(
-            &uri,
-            DocVersion::from(params.text_document.version),
-            params.text_document.language_id.as_str(),
-            params.text_document.text,
-        ) == OpenOutcome::Indexed
-        {
-            // Untitled and out-of-root buffers never enter the index, so no pass.
-            if session.indexable(&uri) {
+    match method.as_str() {
+        DidOpenTextDocument::METHOD => {
+            let Some(params) = notification_params::<DidOpenTextDocumentParams>(&method, params)
+            else {
+                return;
+            };
+            let Some(uri) = document_uri(&method, &params.text_document.uri) else {
+                return;
+            };
+            if session.buffers.open(
+                &uri,
+                DocVersion::from(params.text_document.version),
+                params.text_document.language_id.as_str(),
+                params.text_document.text,
+            ) == OpenOutcome::Indexed
+            {
+                if session.indexable(&uri) {
+                    session.mark_dirty();
+                }
+            } else {
+                tracing::debug!(%uri, "didOpen ignored for unsupported language");
+            }
+        }
+        DidChangeTextDocument::METHOD => {
+            let Some(params) = notification_params::<DidChangeTextDocumentParams>(&method, params)
+            else {
+                return;
+            };
+            let Some(uri) = document_uri(&method, &params.text_document.uri) else {
+                return;
+            };
+            if session
+                .buffers
+                .change(
+                    &uri,
+                    DocVersion::from(params.text_document.version),
+                    &params.content_changes,
+                    session.encoding,
+                )
+                .applied()
+                && session.indexable(&uri)
+            {
                 session.mark_dirty();
             }
-        } else {
-            tracing::debug!(%uri, "didOpen ignored for unsupported language");
         }
-    } else if method == DidChangeTextDocument::METHOD {
-        let Some(params) = notification_params::<DidChangeTextDocumentParams>(&method, params)
-        else {
-            return;
-        };
-        let Some(uri) = document_uri(&method, &params.text_document.uri) else {
-            return;
-        };
-        if session.buffers.change(
-            &uri,
-            DocVersion::from(params.text_document.version),
-            &params.content_changes,
-            session.encoding,
-        ) && session.indexable(&uri)
-        {
-            session.mark_dirty();
+        DidCloseTextDocument::METHOD => {
+            let Some(params) = notification_params::<DidCloseTextDocumentParams>(&method, params)
+            else {
+                return;
+            };
+            let Some(uri) = document_uri(&method, &params.text_document.uri) else {
+                return;
+            };
+            if session.buffers.close(&uri).applied() && session.indexable(&uri) {
+                session.mark_dirty();
+            }
         }
-    } else if method == DidCloseTextDocument::METHOD {
-        let Some(params) = notification_params::<DidCloseTextDocumentParams>(&method, params)
-        else {
-            return;
-        };
-        let Some(uri) = document_uri(&method, &params.text_document.uri) else {
-            return;
-        };
-        if session.buffers.close(&uri) && session.indexable(&uri) {
-            session.mark_dirty();
+        DidSaveTextDocument::METHOD => {
+            let Some(params) = notification_params::<DidSaveTextDocumentParams>(&method, params)
+            else {
+                return;
+            };
+            let Some(uri) = document_uri(&method, &params.text_document.uri) else {
+                return;
+            };
+            session.on_save(&uri, params.text.as_deref());
         }
-    } else if method == DidSaveTextDocument::METHOD {
-        let Some(params) = notification_params::<DidSaveTextDocumentParams>(&method, params) else {
-            return;
-        };
-        let Some(uri) = document_uri(&method, &params.text_document.uri) else {
-            return;
-        };
-        session.on_save(&uri, params.text.as_deref());
-    } else if method == Cancel::METHOD {
-        let Some(params) = notification_params::<CancelParams>(&method, params) else {
-            return;
-        };
-        let id = match params.id {
-            NumberOrString::Number(number) => RequestId::from(number),
-            NumberOrString::String(value) => RequestId::from(value),
-        };
-        cancel.cancel(&id);
-    } else if method == notification::DidChangeWatchedFiles::METHOD {
-        let Some(params) = notification_params::<DidChangeWatchedFilesParams>(&method, params)
-        else {
-            return;
-        };
-        handle_watched_files(connection, session, &params);
+        Cancel::METHOD => {
+            let Some(params) = notification_params::<CancelParams>(&method, params) else {
+                return;
+            };
+            let id = match params.id {
+                NumberOrString::Number(number) => RequestId::from(number),
+                NumberOrString::String(value) => RequestId::from(value),
+            };
+            cancel.cancel(&id);
+        }
+        notification::DidChangeWatchedFiles::METHOD => {
+            let Some(params) = notification_params::<DidChangeWatchedFilesParams>(&method, params)
+            else {
+                return;
+            };
+            handle_watched_files(connection, session, &params);
+        }
+        _ => {}
     }
 }
 
@@ -314,7 +343,6 @@ fn handle_watched_files(
             continue;
         }
         if meta_ast::detect_language(&path).is_some() {
-            // The worker compares fingerprints; the event only marks the workspace dirty.
             source_changed = true;
         } else if is_resolver_config(&path) && resolver_unwarned(session, &path) {
             warn_resolver_change(connection, &path);
@@ -421,6 +449,7 @@ mod tests {
                 "textDocument": { "uri": uri },
                 "previousResultId": open_id,
             }),
+            &|| false,
         )
         .unwrap();
         assert_eq!(echoed["kind"], "unchanged");
@@ -430,6 +459,7 @@ mod tests {
             &session,
             DocumentDiagnosticRequest::METHOD,
             serde_json::json!({ "textDocument": { "uri": uri } }),
+            &|| false,
         )
         .unwrap();
         assert_eq!(full["kind"], "full");
@@ -657,7 +687,7 @@ mod tests {
         let cancel = Cancellation::default();
         let id = RequestId::from(2);
         // The guard keeps the request in flight while the cancel arrives.
-        let in_flight = cancel.register(&id);
+        let in_flight = cancel.register(id.clone());
         cancel.cancel(&id);
 
         handle_request(
@@ -685,7 +715,7 @@ mod tests {
         assert_eq!(error.code, -32800);
         assert_eq!(error.message, "request cancelled");
         drop(in_flight);
-        assert!(cancel.is_empty());
+        assert_eq!(cancel.len(), 0);
     }
 
     #[test]
@@ -710,7 +740,7 @@ mod tests {
             },
         );
 
-        assert!(cancel.is_empty(), "an unknown id must not be remembered");
+        assert_eq!(cancel.len(), 0);
 
         handle_request(
             &server,
@@ -800,12 +830,17 @@ mod tests {
             "contentChanges": [ { "text": "def two(): pass\n" } ]
         });
         let params: DidChangeTextDocumentParams = serde_json::from_value(content).unwrap();
-        assert!(session.buffers.change(
-            &doc_uri(uri.as_str()),
-            DocVersion::from(params.text_document.version),
-            &params.content_changes,
-            session.encoding,
-        ));
+        assert!(
+            session
+                .buffers
+                .change(
+                    &doc_uri(uri.as_str()),
+                    DocVersion::from(params.text_document.version),
+                    &params.content_changes,
+                    session.encoding,
+                )
+                .applied()
+        );
         session.mark_dirty();
 
         handle_notification(

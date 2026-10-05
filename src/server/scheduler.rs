@@ -45,7 +45,6 @@ impl Scheduler {
         match self.req_tx.try_send(req) {
             Ok(()) => Some(seq),
             Err(TrySendError::Full(req)) => {
-                // Held as a seq, not a request: a retry carries its own send-time buffers.
                 self.queued = Some(req.seq);
                 None
             }
