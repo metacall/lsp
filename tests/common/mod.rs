@@ -4,6 +4,7 @@
 
 use std::borrow::Cow;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use meta_call_lsp::convert;
 use meta_call_lsp::index::SourceText;
@@ -14,6 +15,25 @@ pub struct DiskSources;
 
 impl SourceText for DiskSources {
     fn source(&self, path: &Path) -> Option<Cow<'_, str>> {
+        std::fs::read_to_string(path).ok().map(Cow::Owned)
+    }
+}
+
+pub struct CountingSources {
+    pub reads: AtomicUsize,
+}
+
+impl CountingSources {
+    pub fn new() -> Self {
+        Self {
+            reads: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl SourceText for CountingSources {
+    fn source(&self, path: &Path) -> Option<Cow<'_, str>> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
         std::fs::read_to_string(path).ok().map(Cow::Owned)
     }
 }

@@ -137,7 +137,7 @@ fn workspace_symbol_finds_the_python_declaration() {
     let sources = DiskSources;
     let mut ctx = QueryCtx::new(&snapshot, &sources, Encoding::Utf16);
 
-    let symbols = handlers::workspace_symbols(&mut ctx, "multiply");
+    let symbols = handlers::workspace_symbols(&mut ctx, "multiply", &|| false);
 
     assert_eq!(symbols.len(), 1);
     assert_eq!(symbols[0].name, "multiply");
@@ -162,7 +162,7 @@ fn completion_at_the_call_site_offers_the_python_symbol() {
         .expect("the cross-language symbol is offered");
     assert_eq!(
         multiply.sort_text.as_deref(),
-        Some("2multiply"),
+        Some("02-multiply"),
         "cross-language is the third bucket"
     );
 }
