@@ -41,7 +41,10 @@ impl TryFrom<&str> for DocUri {
         let url = Url::parse(value).map_err(|error| {
             ServerError::InvalidParams(format!("document URI {value}: {error}"))
         })?;
-        let path = url.to_file_path().ok();
+        let path = url
+            .to_file_path()
+            .ok()
+            .map(|path| dunce::simplified(&path).to_path_buf());
         Ok(Self { url, path })
     }
 }
@@ -160,10 +163,17 @@ mod tests {
 
     #[test]
     fn a_file_uri_yields_its_path() {
-        let uri = DocUri::try_from("file:///tmp/a.py").expect("file uri");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("a.py");
+        let uri = crate::convert::path_to_uri(&path).expect("uri");
+        let doc = DocUri::try_from(uri.as_str()).expect("file uri");
 
-        assert_eq!(uri.to_path(), Some(PathBuf::from("/tmp/a.py")));
-        assert_eq!(uri.as_str(), "file:///tmp/a.py");
+        assert_eq!(
+            doc.to_path()
+                .map(|path| dunce::simplified(&path).to_path_buf()),
+            Some(dunce::simplified(&path).to_path_buf())
+        );
+        assert_eq!(doc.as_str(), uri.as_str());
     }
 
     #[test]
