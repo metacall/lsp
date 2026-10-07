@@ -63,21 +63,18 @@ fn clamp_boundary(text: &str, byte: usize) -> usize {
 }
 
 /// Precomputed line starts: one scan to build, then O(log lines) per conversion.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LineIndex {
     starts: Vec<usize>,
 }
 
 impl LineIndex {
     pub fn new(text: &str) -> Self {
-        let mut starts = Vec::new();
-        starts.push(0);
-        for (index, byte) in text.bytes().enumerate() {
-            if byte == b'\n' {
-                starts.push(index + 1);
-            }
+        Self {
+            starts: std::iter::once(0)
+                .chain(text.match_indices('\n').map(|(index, _)| index + 1))
+                .collect(),
         }
-        Self { starts }
     }
 
     fn line_start(&self, line: u32) -> Option<usize> {
@@ -116,8 +113,8 @@ impl LineIndex {
             .map(|ch| units_of(ch, encoding))
             .sum::<usize>();
         Position {
-            line: u32::try_from(line).unwrap_or(u32::MAX),
-            character: u32::try_from(character).unwrap_or(u32::MAX),
+            line: line.min(u32::MAX as usize) as u32,
+            character: character.min(u32::MAX as usize) as u32,
         }
     }
 
@@ -129,14 +126,14 @@ impl LineIndex {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SourceFile {
-    text: String,
+    text: std::sync::Arc<str>,
     lines: LineIndex,
 }
 
 impl SourceFile {
-    pub fn new(text: impl Into<String>) -> Self {
+    pub fn new(text: impl Into<std::sync::Arc<str>>) -> Self {
         let text = text.into();
         let lines = LineIndex::new(&text);
         Self { text, lines }
@@ -159,12 +156,12 @@ impl SourceFile {
 pub fn range_without_text(range: &SourceRange) -> Range {
     Range {
         start: Position {
-            line: u32::try_from(range.start.line).unwrap_or(u32::MAX),
-            character: u32::try_from(range.start.column).unwrap_or(u32::MAX),
+            line: (range.start.line as u64).min(u64::from(u32::MAX)) as u32,
+            character: (range.start.column as u64).min(u64::from(u32::MAX)) as u32,
         },
         end: Position {
-            line: u32::try_from(range.end.line).unwrap_or(u32::MAX),
-            character: u32::try_from(range.end.column).unwrap_or(u32::MAX),
+            line: (range.end.line as u64).min(u64::from(u32::MAX)) as u32,
+            character: (range.end.column as u64).min(u64::from(u32::MAX)) as u32,
         },
     }
 }

@@ -35,16 +35,19 @@ pub struct CacheLoad {
 pub fn save(
     root: &Path,
     snapshot: &IndexSnapshot,
-    overlays: &HashSet<PathBuf>,
+    overlays: &HashSet<&Path>,
 ) -> anyhow::Result<()> {
     let dir = root.join(INDEX_DIR_NAME);
     fs::create_dir_all(dir.join("shards"))?;
-    let previous: HashMap<PathBuf, ShardManifestRecord> = File::open(dir.join(MANIFEST_FILE))
-        .map(|file| read_manifest(BufReader::new(file)))
-        .unwrap_or_else(|_| Ok(Vec::new()))?
-        .into_iter()
-        .map(|record| (record.path.clone(), record))
-        .collect();
+    let previous: HashMap<PathBuf, ShardManifestRecord> = match File::open(dir.join(MANIFEST_FILE))
+    {
+        Ok(file) => read_manifest(BufReader::new(file))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(error.into()),
+    }
+    .into_iter()
+    .map(|record| (record.path.clone(), record))
+    .collect();
 
     let mut records: Vec<ShardManifestRecord> = Vec::with_capacity(snapshot.extractions.len());
     let mut by_bucket: HashMap<String, Vec<usize>> = HashMap::new();
@@ -52,7 +55,7 @@ pub fn save(
     let mut kept_paths: HashSet<PathBuf> = HashSet::new();
 
     for (index, file) in snapshot.extractions.iter().enumerate() {
-        if overlays.contains(&file.path) || !file.path.starts_with(root) {
+        if overlays.contains(file.path.as_path()) || !file.path.starts_with(root) {
             continue;
         }
         // Manifest and payload paths are stored relative to the root, so the
@@ -79,7 +82,6 @@ pub fn save(
 
     let mut referenced: HashSet<String> = HashSet::new();
     for (shard, indices) in &by_bucket {
-        referenced.insert(shard.clone());
         if !touched.contains(shard) {
             continue;
         }
@@ -128,16 +130,13 @@ fn manifest_record(
     touched: &mut HashSet<String>,
 ) -> Option<ShardManifestRecord> {
     let indexed = indexed?;
-    let reused = previous.get(stored).and_then(|prev| {
-        (prev.content_hash == hex(indexed.as_bytes())
-            && prev.shard == bucket_for(&prev.content_hash))
-        .then(|| prev.clone())
-    });
-    if let Some(record) = reused {
-        return Some(record);
-    }
-
     let hash = hex(indexed.as_bytes());
+    if let Some(prev) = previous.get(stored)
+        && prev.content_hash == hash
+        && prev.shard == bucket_for(&prev.content_hash)
+    {
+        return Some(prev.clone());
+    }
     let shard = bucket_for(&hash);
     touched.insert(shard.clone());
     if let Some(prev) = previous.get(stored)
@@ -145,10 +144,17 @@ fn manifest_record(
     {
         touched.insert(prev.shard.clone());
     }
+    let len = match fs::metadata(&file.path) {
+        Ok(metadata) => metadata.len(),
+        Err(error) => {
+            tracing::warn!(path = %file.path.display(), %error, "shard metadata failed");
+            return None;
+        }
+    };
     Some(ShardManifestRecord::new(
         stored.to_path_buf(),
         hash,
-        fs::metadata(&file.path).ok()?.len(),
+        len,
         mtime_seconds(&file.path),
         shard,
     ))
@@ -235,13 +241,11 @@ fn seed_cache(root: &Path, watch: &mut WatchState, extractions: Vec<Arc<FileExtr
             );
             continue;
         }
-        // The payload carries a root-relative path; the cache is keyed and read
-        // by absolute paths everywhere else, so normalize before seeding.
-        let mut extraction = (*extraction).clone();
-        extraction.path = absolute.clone();
+        let mut owned = Arc::unwrap_or_clone(extraction);
+        owned.path = absolute.clone();
         watch
             .cache_mut()
-            .update(absolute, Fingerprint::of(&bytes), Arc::new(extraction));
+            .update(absolute, Fingerprint::of(&bytes), Arc::new(owned));
         seeded += 1;
     }
     seeded

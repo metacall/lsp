@@ -1,9 +1,9 @@
 //! Request cancellation tokens. Only an in-flight request is cancellable: the
 //! transport is FIFO, so a remembered cancel set would be unbounded state.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use lsp_server::RequestId;
@@ -13,11 +13,11 @@ struct CancelToken(Arc<AtomicBool>);
 
 impl CancelToken {
     fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Relaxed)
+        self.0.load(Ordering::Acquire)
     }
 
     fn cancel(&self) {
-        self.0.store(true, Ordering::Relaxed);
+        self.0.store(true, Ordering::Release);
     }
 }
 
@@ -41,44 +41,48 @@ impl Drop for Registration<'_> {
 
 #[derive(Default)]
 pub struct Cancellation {
-    tokens: RefCell<HashMap<RequestId, CancelToken>>,
+    tokens: Mutex<HashMap<RequestId, CancelToken>>,
 }
 
 impl Cancellation {
-    pub fn register(&self, id: &RequestId) -> Registration<'_> {
-        let token = self
-            .tokens
-            .borrow_mut()
-            .entry(id.clone())
-            .or_default()
-            .clone();
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<RequestId, CancelToken>> {
+        self.tokens
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub fn register(&self, id: RequestId) -> Registration<'_> {
+        let token = self.lock().entry(id.clone()).or_default().clone();
         Registration {
             cancel: self,
-            id: id.clone(),
+            id,
             token,
         }
     }
 
     /// Mark an in-flight request as cancelled; any other id is a no-op.
     pub fn cancel(&self, id: &RequestId) {
-        match self.tokens.borrow().get(id) {
+        match self.lock().get(id) {
             Some(token) => token.cancel(),
             None => tracing::debug!(?id, "cancel for a request that is not in flight"),
         }
     }
 
     fn remove(&self, id: &RequestId) {
-        self.tokens.borrow_mut().remove(id);
+        self.lock().remove(id);
     }
 
     #[cfg(test)]
     pub fn len(&self) -> usize {
-        self.tokens.borrow().len()
+        self.lock().len()
     }
 
     #[cfg(test)]
     pub fn is_empty(&self) -> bool {
-        self.tokens.borrow().is_empty()
+        self.tokens
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty()
     }
 }
 
@@ -89,8 +93,8 @@ mod tests {
     #[test]
     fn cancel_sets_only_the_target_token() {
         let cancellation = Cancellation::default();
-        let first = cancellation.register(&RequestId::from(1));
-        let second = cancellation.register(&RequestId::from(2));
+        let first = cancellation.register(RequestId::from(1));
+        let second = cancellation.register(RequestId::from(2));
 
         cancellation.cancel(&RequestId::from(1));
         assert!(first.is_cancelled());
@@ -108,11 +112,8 @@ mod tests {
         cancellation.cancel(&id);
         cancellation.cancel(&id);
 
-        assert!(
-            cancellation.is_empty(),
-            "an unknown id must not be remembered"
-        );
-        let later = cancellation.register(&id);
+        assert_eq!(cancellation.len(), 0);
+        let later = cancellation.register(id);
         assert!(
             !later.is_cancelled(),
             "a cancel for a request that never arrived must not cancel a later one"
@@ -122,10 +123,9 @@ mod tests {
     #[test]
     fn dropping_a_registration_cleans_the_registry() {
         let cancellation = Cancellation::default();
-        let id = RequestId::from(5);
-        let guard = cancellation.register(&id);
+        let guard = cancellation.register(RequestId::from(5));
         assert_eq!(cancellation.len(), 1);
         drop(guard);
-        assert!(cancellation.is_empty());
+        assert_eq!(cancellation.len(), 0);
     }
 }

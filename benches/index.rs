@@ -1,6 +1,6 @@
 //! Cold-start and warm-tick timings. Run with `cargo bench --bench index`; the
 //! cases report timings only and CI does not gate on them.
-#![expect(
+#![allow(
     clippy::unwrap_used,
     reason = "a bench harness may abort on setup failure"
 )]
@@ -43,7 +43,7 @@ fn tree_with_index() -> tempfile::TempDir {
 
 fn cold_start(c: &mut Criterion) {
     let mut group = c.benchmark_group("cold_start");
-    group.sample_size(10);
+    group.sample_size(20);
 
     group.bench_function("full_extract", |b| {
         b.iter_batched(
@@ -61,7 +61,7 @@ fn cold_start(c: &mut Criterion) {
         b.iter_batched(
             tree_with_index,
             |dir| {
-                let mut reindexer = Reindexer::new();
+                let mut reindexer = Reindexer::with_persistence(Persistence::Enabled);
                 reindexer.seed_from_shards(dir.path());
                 reindexer.rebuild(dir.path(), &[]).unwrap()
             },
@@ -74,7 +74,7 @@ fn cold_start(c: &mut Criterion) {
 
 fn warm_tick(c: &mut Criterion) {
     let mut group = c.benchmark_group("warm_tick");
-    group.sample_size(10);
+    group.sample_size(20);
 
     let dir = tempfile::tempdir().unwrap();
     write_tree(dir.path());
@@ -83,13 +83,16 @@ fn warm_tick(c: &mut Criterion) {
 
     let mut ticks = 0usize;
     group.bench_function("one_file_changed", |b| {
-        b.iter(|| {
-            ticks += 1;
-            let index = ticks % FILES;
-            let path = dir.path().join(format!("mod_{index}.py"));
-            std::fs::write(&path, format!("# tick {ticks}\n{}", source(index))).unwrap();
-            reindexer.rebuild(dir.path(), &[]).unwrap()
-        });
+        b.iter_batched(
+            || {
+                ticks += 1;
+                let index = ticks % FILES;
+                let path = dir.path().join(format!("mod_{index}.py"));
+                std::fs::write(&path, format!("# tick {ticks}\n{}", source(index))).unwrap();
+            },
+            |_| reindexer.rebuild(dir.path(), &[]).unwrap(),
+            BatchSize::SmallInput,
+        );
     });
 
     group.finish();

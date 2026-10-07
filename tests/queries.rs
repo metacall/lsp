@@ -50,7 +50,7 @@ impl TestSources {
         let mut overlay = HashMap::new();
         for (uri, doc) in buffers.iter() {
             if let Some(path) = uri.to_path() {
-                overlay.insert(path, doc.text.clone());
+                overlay.insert(path, doc.text.to_string());
             }
         }
         Self {
@@ -389,8 +389,11 @@ fn workspace_symbols_read_each_file_once() {
         ("gamma.py", "def gamma(): pass\n"),
     ]);
 
-    let symbols =
-        handlers::workspace_symbols(&mut QueryCtx::new(&snapshot, &sources, Encoding::Utf16), "");
+    let symbols = handlers::workspace_symbols(
+        &mut QueryCtx::new(&snapshot, &sources, Encoding::Utf16),
+        "",
+        &|| false,
+    );
     let mut names: Vec<&str> = symbols.iter().map(|symbol| symbol.name.as_str()).collect();
     names.sort_unstable();
     assert_eq!(names, ["alpha", "beta", "gamma"]);
@@ -413,21 +416,25 @@ fn completion_matches_case_insensitively_when_exact_matches_are_absent() {
         .iter()
         .find(|item| item.label == "GREET")
         .expect("case-insensitive completion");
-    assert_eq!(item.sort_text.as_deref(), Some("0GREET"));
+    assert_eq!(item.sort_text.as_deref(), Some("00-GREET"));
 }
 
 #[test]
 fn workspace_symbols_filter_by_query() {
     let (_dir, snapshot, sources) = workspace(&[("a.py", APP), ("b.ts", TS)]);
 
-    let all =
-        handlers::workspace_symbols(&mut QueryCtx::new(&snapshot, &sources, Encoding::Utf16), "");
+    let all = handlers::workspace_symbols(
+        &mut QueryCtx::new(&snapshot, &sources, Encoding::Utf16),
+        "",
+        &|| false,
+    );
     assert!(all.iter().any(|symbol| symbol.name == "greet"));
     assert!(all.iter().any(|symbol| symbol.name == "add"));
 
     let filtered = handlers::workspace_symbols(
         &mut QueryCtx::new(&snapshot, &sources, Encoding::Utf16),
         "gre",
+        &|| false,
     );
     assert_eq!(filtered.len(), 1);
     assert_eq!(filtered[0].name, "greet");
@@ -443,6 +450,7 @@ fn workspace_symbols_match_exactly_then_by_substring() {
     let matched = handlers::workspace_symbols(
         &mut QueryCtx::new(&snapshot, &sources, Encoding::Utf16),
         "greet",
+        &|| false,
     );
     let names: Vec<&str> = matched.iter().map(|symbol| symbol.name.as_str()).collect();
     assert_eq!(
@@ -459,6 +467,7 @@ fn workspace_symbols_have_no_fuzzy_tier() {
     let matched = handlers::workspace_symbols(
         &mut QueryCtx::new(&snapshot, &sources, Encoding::Utf16),
         "grt",
+        &|| false,
     );
 
     assert!(
@@ -474,6 +483,7 @@ fn workspace_symbols_match_non_ascii_case_insensitively() {
     let matched = handlers::workspace_symbols(
         &mut QueryCtx::new(&snapshot, &sources, Encoding::Utf16),
         "NAÏVE",
+        &|| false,
     );
 
     assert_eq!(matched.len(), 1);
@@ -487,8 +497,11 @@ fn workspace_symbols_empty_query_returns_all_in_documented_order() {
         ("b.py", "def beta(): pass\n"),
     ]);
 
-    let symbols =
-        handlers::workspace_symbols(&mut QueryCtx::new(&snapshot, &sources, Encoding::Utf16), "");
+    let symbols = handlers::workspace_symbols(
+        &mut QueryCtx::new(&snapshot, &sources, Encoding::Utf16),
+        "",
+        &|| false,
+    );
 
     let order: Vec<&str> = symbols.iter().map(|symbol| symbol.name.as_str()).collect();
     assert_eq!(

@@ -15,17 +15,18 @@ enum MatchTier {
 }
 
 /// Empty query matches every symbol; otherwise exact first, then case-insensitive substring.
-fn match_tier(name: &str, query: &str, folded_query: &str) -> Option<MatchTier> {
+fn match_tier(name: &str, folded_name: &str, query: &str, folded_query: &str) -> Option<MatchTier> {
     if query.is_empty() || name == query {
         return Some(MatchTier::Exact);
     }
-    name.to_lowercase()
-        .contains(folded_query)
-        .then_some(MatchTier::Substring)
+    if name.contains(query) || folded_name.contains(folded_query) {
+        return Some(MatchTier::Substring);
+    }
+    None
 }
 
 /// One flat level; `selectionRange` must sit inside `range`: the identifier when captured, else the symbol range.
-#[expect(deprecated)]
+#[allow(deprecated)]
 pub fn document_symbols(ctx: &mut QueryCtx, uri: &DocUri) -> Vec<DocumentSymbol> {
     let Some(file) = ctx.document(uri) else {
         return Vec::new();
@@ -49,15 +50,34 @@ pub fn document_symbols(ctx: &mut QueryCtx, uri: &DocUri) -> Vec<DocumentSymbol>
 }
 
 /// Ordered by (tier, path, declaration byte, name, id), capped after that order; `containerName` omitted.
-pub fn workspace_symbols(ctx: &mut QueryCtx, query: &str) -> Vec<WorkspaceSymbol> {
+pub fn workspace_symbols(
+    ctx: &mut QueryCtx,
+    query: &str,
+    cancelled: &dyn Fn() -> bool,
+) -> Vec<WorkspaceSymbol> {
     let folded_query = query.to_lowercase();
-    let mut matches: Vec<(&meta_ast::Symbol, MatchTier)> = ctx
-        .snapshot()
-        .symbols()
-        .filter_map(|symbol| {
-            match_tier(&symbol.name, query, &folded_query).map(|tier| (symbol, tier))
-        })
-        .collect();
+    let mut matches: Vec<(&meta_ast::Symbol, MatchTier)> = Vec::new();
+    for symbol in ctx.snapshot().symbols() {
+        if matches.len().is_multiple_of(256) && cancelled() {
+            break;
+        }
+        let folded_name = symbol.name.to_lowercase();
+        if let Some(tier) = match_tier(&symbol.name, &folded_name, query, &folded_query) {
+            matches.push((symbol, tier));
+        }
+    }
+    if matches.len() > CAP_WORKSPACE_SYMBOLS * 4 {
+        let (_, _, _) =
+            matches.select_nth_unstable_by(CAP_WORKSPACE_SYMBOLS, |(a, a_tier), (b, b_tier)| {
+                a_tier
+                    .cmp(b_tier)
+                    .then_with(|| a.file_path.cmp(&b.file_path))
+                    .then_with(|| a.source_range.byte_start.cmp(&b.source_range.byte_start))
+                    .then_with(|| a.name.cmp(&b.name))
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+        matches.truncate(CAP_WORKSPACE_SYMBOLS);
+    }
     matches.sort_by(|(a, a_tier), (b, b_tier)| {
         a_tier
             .cmp(b_tier)
@@ -66,7 +86,10 @@ pub fn workspace_symbols(ctx: &mut QueryCtx, query: &str) -> Vec<WorkspaceSymbol
             .then_with(|| a.name.cmp(&b.name))
             .then_with(|| a.id.cmp(&b.id))
     });
-    matches.truncate(CAP_WORKSPACE_SYMBOLS);
+    if matches.len() > CAP_WORKSPACE_SYMBOLS {
+        tracing::debug!(total = matches.len(), "workspace symbols truncated");
+        matches.truncate(CAP_WORKSPACE_SYMBOLS);
+    }
 
     matches
         .into_iter()
@@ -89,7 +112,8 @@ mod tests {
     use super::*;
 
     fn tier(name: &str, query: &str) -> Option<MatchTier> {
-        match_tier(name, query, &query.to_lowercase())
+        let folded_name = name.to_lowercase();
+        match_tier(name, &folded_name, query, &query.to_lowercase())
     }
 
     #[test]

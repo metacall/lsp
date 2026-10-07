@@ -11,11 +11,40 @@ pub fn path_to_uri(path: &Path) -> Option<Uri> {
 }
 
 pub fn symbol_kind(kind: meta_ast::SymbolKind) -> SymbolKind {
-    kind_pair(kind).0
+    use meta_ast::SymbolKind as Engine;
+    match kind {
+        Engine::Function => SymbolKind::FUNCTION,
+        Engine::Method => SymbolKind::METHOD,
+        Engine::Class => SymbolKind::CLASS,
+        Engine::Struct => SymbolKind::STRUCT,
+        Engine::Interface | Engine::Trait => SymbolKind::INTERFACE,
+        Engine::Enum => SymbolKind::ENUM,
+        Engine::Object => SymbolKind::OBJECT,
+        Engine::Constant => SymbolKind::CONSTANT,
+        Engine::Module => SymbolKind::MODULE,
+        Engine::Namespace => SymbolKind::NAMESPACE,
+        Engine::TypeAlias => SymbolKind::TYPE_PARAMETER,
+        _ => {
+            tracing::debug!(?kind, "unknown symbol kind, using variable");
+            SymbolKind::VARIABLE
+        }
+    }
 }
 
 pub fn completion_kind(kind: meta_ast::SymbolKind) -> CompletionItemKind {
-    kind_pair(kind).1
+    use meta_ast::SymbolKind as Engine;
+    match kind {
+        Engine::Function => CompletionItemKind::FUNCTION,
+        Engine::Method => CompletionItemKind::METHOD,
+        Engine::Class => CompletionItemKind::CLASS,
+        Engine::Struct => CompletionItemKind::STRUCT,
+        Engine::Interface | Engine::Trait => CompletionItemKind::INTERFACE,
+        Engine::Enum => CompletionItemKind::ENUM,
+        Engine::Object | Engine::Module | Engine::Namespace => CompletionItemKind::MODULE,
+        Engine::Constant => CompletionItemKind::CONSTANT,
+        Engine::TypeAlias => CompletionItemKind::TYPE_PARAMETER,
+        _ => CompletionItemKind::VARIABLE,
+    }
 }
 
 /// Human word for one engine symbol kind; hover renders this, not the engine debug text.
@@ -35,28 +64,6 @@ pub fn kind_word(kind: meta_ast::SymbolKind) -> &'static str {
         Engine::Namespace => "namespace",
         Engine::TypeAlias => "type alias",
         _ => "variable",
-    }
-}
-
-/// LSP kind pair; LSP has no OBJECT completion kind, so an Object completes as MODULE.
-fn kind_pair(kind: meta_ast::SymbolKind) -> (SymbolKind, CompletionItemKind) {
-    use meta_ast::SymbolKind as Engine;
-    match kind {
-        Engine::Function => (SymbolKind::FUNCTION, CompletionItemKind::FUNCTION),
-        Engine::Method => (SymbolKind::METHOD, CompletionItemKind::METHOD),
-        Engine::Class => (SymbolKind::CLASS, CompletionItemKind::CLASS),
-        Engine::Struct => (SymbolKind::STRUCT, CompletionItemKind::STRUCT),
-        Engine::Interface | Engine::Trait => (SymbolKind::INTERFACE, CompletionItemKind::INTERFACE),
-        Engine::Enum => (SymbolKind::ENUM, CompletionItemKind::ENUM),
-        Engine::Object => (SymbolKind::OBJECT, CompletionItemKind::MODULE),
-        Engine::Constant => (SymbolKind::CONSTANT, CompletionItemKind::CONSTANT),
-        Engine::Module => (SymbolKind::MODULE, CompletionItemKind::MODULE),
-        Engine::Namespace => (SymbolKind::NAMESPACE, CompletionItemKind::MODULE),
-        Engine::TypeAlias => (
-            SymbolKind::TYPE_PARAMETER,
-            CompletionItemKind::TYPE_PARAMETER,
-        ),
-        _ => (SymbolKind::VARIABLE, CompletionItemKind::VARIABLE),
     }
 }
 

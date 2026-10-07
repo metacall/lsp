@@ -7,6 +7,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  INSTA_UPDATE: "no"
+  RUST_BACKTRACE: "1"
 
 jobs:
   gates:
@@ -30,7 +32,18 @@ jobs:
         run: cargo build --locked
       - name: Test
         run: cargo test --locked
+      - name: Bench (no run)
+        run: cargo bench --locked --no-run
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Format
         run: cargo fmt --check
+      - name: Upload snapshots
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: snapshots-${{ matrix.os }}
+          path: |
+            tests/snapshots/*.snap.new
+            **/*.snap.new
+          if-no-files-found: ignore

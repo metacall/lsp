@@ -18,6 +18,7 @@ pub struct ReindexReq {
 pub struct ReindexResp {
     pub seq: u64,
     pub elapsed_ms: u128,
+    pub coalesced: usize,
     pub result: Result<Arc<IndexSnapshot>, ReindexError>,
 }
 
@@ -29,18 +30,28 @@ pub fn spawn_worker(
     std::thread::spawn(move || {
         while let Ok(first) = req_rx.recv() {
             let mut latest = first;
-            // Keep the highest seq: a retried held request may carry a lower seq than one queued behind it.
+            let mut coalesced = 0;
             while let Ok(newer) = req_rx.try_recv() {
+                coalesced += 1;
                 if newer.seq > latest.seq {
                     latest = newer;
                 }
             }
             let start = Instant::now();
-            // A panic here kills the worker; the loop then answers index requests with an error.
-            let result = reindexer.rebuild(&latest.root, &latest.overlays);
+            let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                reindexer.rebuild(&latest.root, &latest.overlays)
+            })) {
+                Ok(result) => result,
+                Err(payload) => {
+                    let message = crate::error::panic_message(payload);
+                    tracing::error!(%message, "reindex worker panicked; index unavailable");
+                    Err(ReindexError::Panicked(message))
+                }
+            };
             let resp = ReindexResp {
                 seq: latest.seq,
                 elapsed_ms: start.elapsed().as_millis(),
+                coalesced,
                 result,
             };
             if resp_tx.send(resp).is_err() {

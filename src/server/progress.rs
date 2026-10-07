@@ -28,7 +28,7 @@ pub(crate) enum Progress {
 pub(crate) struct ProgressTracker {
     supported: bool,
     progress: Progress,
-    token: NumberOrString,
+    token: Option<NumberOrString>,
     next_id: u64,
     armed: Option<u64>,
 }
@@ -38,7 +38,7 @@ impl ProgressTracker {
         Self {
             supported,
             progress: Progress::Idle,
-            token: NumberOrString::String(String::new()),
+            token: None,
             next_id: 0,
             armed: None,
         }
@@ -52,7 +52,7 @@ impl ProgressTracker {
     }
 
     pub(crate) fn pump(&mut self, connection: &Connection) {
-        if self.progress == Progress::Idle
+        if matches!(self.progress, Progress::Idle)
             && let Some(seq) = self.armed.take()
         {
             self.start(connection, seq);
@@ -96,12 +96,7 @@ impl ProgressTracker {
         }
     }
 
-    /// Close any open progress after a worker loss or shutdown.
-    pub(crate) fn abandon(&mut self, connection: &Connection) {
-        self.close(connection);
-    }
-
-    fn close(&mut self, connection: &Connection) {
+    pub(crate) fn close(&mut self, connection: &Connection) {
         if matches!(self.progress, Progress::Active { .. }) {
             self.send_end(connection);
         }
@@ -109,53 +104,68 @@ impl ProgressTracker {
     }
 
     fn start(&mut self, connection: &Connection, seq: u64) {
-        self.next_id += 1;
-        let token = NumberOrString::String(ids::reindex_progress_token(self.next_id));
-        let ack = ids::reindex_progress_ack(self.next_id);
+        self.next_id = self.next_id.wrapping_add(1);
+        let id = ids::ProgressId(self.next_id);
+        let token = id.token();
+        let ack = id.ack();
+        let params = match serde_json::to_value(WorkDoneProgressCreateParams {
+            token: token.clone(),
+        }) {
+            Ok(params) => params,
+            Err(error) => {
+                tracing::warn!(%error, "progress create serialization failed");
+                return;
+            }
+        };
         let create = WireRequest {
             id: ack.clone(),
             method: WorkDoneProgressCreate::METHOD.to_string(),
-            params: serde_json::to_value(WorkDoneProgressCreateParams {
-                token: token.clone(),
-            })
-            .unwrap_or(serde_json::Value::Null),
+            params,
         };
-        let _ = connection.sender.send(Message::Request(create));
+        if connection.sender.send(Message::Request(create)).is_err() {
+            tracing::debug!("progress create send failed");
+        }
         self.progress = Progress::Launching { ack, seq };
-        self.token = token;
+        self.token = Some(token);
+    }
+
+    fn send_progress(&self, connection: &Connection, value: WorkDoneProgress) {
+        let Some(token) = self.token.clone() else {
+            return;
+        };
+        let params = ProgressParams {
+            token,
+            value: ProgressParamsValue::WorkDone(value),
+        };
+        if connection
+            .sender
+            .send(Message::Notification(WireNotification::new(
+                "$/progress".to_string(),
+                params,
+            )))
+            .is_err()
+        {
+            tracing::debug!("progress notification send failed");
+        }
     }
 
     fn send_begin(&self, connection: &Connection) {
-        let begin = ProgressParams {
-            token: self.token.clone(),
-            value: ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(WorkDoneProgressBegin {
+        self.send_progress(
+            connection,
+            WorkDoneProgress::Begin(WorkDoneProgressBegin {
                 title: "Indexing workspace".to_string(),
                 cancellable: Some(false),
                 message: None,
                 percentage: None,
-            })),
-        };
-        let _ = connection
-            .sender
-            .send(Message::Notification(WireNotification::new(
-                "$/progress".to_string(),
-                begin,
-            )));
+            }),
+        );
     }
 
     fn send_end(&self, connection: &Connection) {
-        let end = ProgressParams {
-            token: self.token.clone(),
-            value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(WorkDoneProgressEnd {
-                message: None,
-            })),
-        };
-        let _ = connection
-            .sender
-            .send(Message::Notification(WireNotification::new(
-                "$/progress".to_string(),
-                end,
-            )));
+        self.send_progress(
+            connection,
+            WorkDoneProgress::End(WorkDoneProgressEnd { message: None }),
+        );
     }
 }
 
@@ -166,13 +176,13 @@ mod tests {
 
     fn tracker() -> ProgressTracker {
         let mut tracker = ProgressTracker::new(true);
-        tracker.token = NumberOrString::String(ids::reindex_progress_token(1));
+        tracker.token = Some(crate::server::ids::ProgressId(1).token());
         tracker
     }
 
     fn launch(seq: u64) -> (ProgressTracker, RequestId) {
         let mut tracker = tracker();
-        let ack = ids::reindex_progress_ack(seq);
+        let ack = crate::server::ids::ProgressId(seq).ack();
         tracker.progress = Progress::Launching {
             ack: ack.clone(),
             seq,
@@ -234,7 +244,7 @@ mod tests {
         assert_eq!(tracker.progress, Progress::Active { seq: 7 });
         assert_eq!(
             next_progress_message(&client).token,
-            NumberOrString::String(ids::reindex_progress_token(1))
+            crate::server::ids::ProgressId(1).token()
         );
     }
 
@@ -320,16 +330,16 @@ mod tests {
     }
 
     #[test]
-    fn abandon_ends_active_but_not_launching() {
+    fn close_ends_active_but_not_launching() {
         let (server, client) = Connection::memory();
         let (mut tracker, _) = launch(4);
 
-        tracker.abandon(&server);
+        tracker.close(&server);
         assert_eq!(tracker.progress, Progress::Idle);
         expect_silence(&client);
 
         tracker.progress = Progress::Active { seq: 4 };
-        tracker.abandon(&server);
+        tracker.close(&server);
         assert_eq!(tracker.progress, Progress::Idle);
         next_progress_message(&client);
     }

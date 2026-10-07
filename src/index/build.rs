@@ -64,7 +64,7 @@ impl Reindexer {
             change.files_added + change.files_modified + change.files_removed == 0;
         if no_file_changed
             && let Some(last) = &self.last
-            && last.version_map() == &versions
+            && last.versions_match(&versions)
         {
             return Ok(Arc::clone(last));
         }
@@ -78,9 +78,9 @@ impl Reindexer {
             versions,
         )?);
         if self.persistence == Persistence::Enabled {
-            let overlay_paths: HashSet<PathBuf> = overlays
+            let overlay_paths: HashSet<&Path> = overlays
                 .iter()
-                .map(|overlay| overlay.path.clone())
+                .map(|overlay| overlay.path.as_path())
                 .collect();
             if let Err(error) = shards::save(root, &snapshot, &overlay_paths) {
                 tracing::warn!(%error, "shard save failed, keeping prior index");
@@ -106,16 +106,17 @@ pub fn rebuild_from_inputs(
 }
 
 pub fn collect_inputs(root: &Path, buffers: &BufferStore) -> Vec<Overlay> {
+    let root = dunce::simplified(root);
     let mut inputs = Vec::new();
     for (uri, doc) in buffers.iter() {
         if let Some(path) = uri.to_path()
-            && path.starts_with(root)
+            && dunce::simplified(&path).starts_with(root)
         {
             inputs.push(Overlay {
                 uri: uri.as_str().to_string(),
                 path,
-                text: doc.text.clone(),
-                version: doc.version.get(),
+                text: doc.text.to_string(),
+                version: doc.version.value(),
                 lang: doc.lang,
             });
         }
@@ -132,11 +133,9 @@ fn finish_snapshot(
     state: &WatchState,
     versions: HashMap<PathBuf, DocVersion>,
 ) -> Result<IndexSnapshot, ReindexError> {
-    let raw = if snapshot_raw == 0 { 1 } else { snapshot_raw };
-    let Some(id) = SnapshotId::new(raw) else {
+    let Some(id) = SnapshotId::new(snapshot_raw) else {
         return Err(ReindexError::Exhausted);
     };
-    // One engine pass gives the graph, the SCC, the scope cache and the records.
     let (analysis, mut graph_diagnostics) =
         meta_ast::pipeline::build_analysis(extractions, root, id);
     diagnostics.append(&mut graph_diagnostics);
@@ -146,29 +145,31 @@ fn finish_snapshot(
         scope,
         references,
         extractions,
+        client_calls,
         ..
     } = analysis;
 
-    // The builder resolves call sites for edges but hides the records; one more pass produces them, and diagnostics stay the builder's.
-    let call_sites: Vec<meta_ast::deploy::scanner::CallSite> = extractions
-        .iter()
-        .flat_map(|file| file.call_sites.iter().cloned())
-        .collect();
-    let client_calls = if call_sites.is_empty() {
-        Vec::new()
-    } else {
-        meta_ast::deploy::client_call::resolve_client_call_projections(
-            &graph,
-            &extractions,
-            &call_sites,
-            root,
-        )
-        .resolved
-    };
-
-    // Derived key views over one pass: path lookups go through `by_path`, every
-    // other map keys on the extraction index so paths are stored once.
     let maps = DerivedMaps::new(&extractions, &graph, &references, state);
+    let mut diagnostics_by_path: HashMap<PathBuf, Vec<usize>> = HashMap::new();
+    for (index, diagnostic) in diagnostics.iter().enumerate() {
+        diagnostics_by_path
+            .entry(diagnostic.path.clone())
+            .or_default()
+            .push(index);
+    }
+    let mut client_calls_by_site: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
+    for (call_index, call) in client_calls.iter().enumerate() {
+        let Some(byte) = call.source_range.as_ref().map(|range| range.byte_start) else {
+            continue;
+        };
+        let Some(&file) = maps.by_path.get(&call.source_file) else {
+            continue;
+        };
+        client_calls_by_site
+            .entry((file, byte))
+            .or_default()
+            .push(call_index);
+    }
 
     let mut snapshot = IndexSnapshot {
         extractions,
@@ -184,6 +185,8 @@ fn finish_snapshot(
         occurrences: HashMap::new(),
         content_hashes: maps.content_hashes,
         versions,
+        diagnostics_by_path,
+        client_calls_by_site,
     };
     fill_occurrences(&mut snapshot);
     Ok(snapshot)

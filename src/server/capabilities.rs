@@ -61,8 +61,7 @@ pub(crate) fn capabilities(encoding: Encoding) -> ServerCapabilities {
 pub(crate) fn supports_pull_diagnostics(caps: &ClientCapabilities) -> bool {
     caps.text_document
         .as_ref()
-        .and_then(|text_document| text_document.diagnostic.as_ref())
-        .is_some()
+        .is_some_and(|text_document| text_document.diagnostic.is_some())
 }
 
 /// Dynamic registration is the only portable way to receive external changes.
@@ -70,24 +69,26 @@ pub(crate) fn supports_watched_files(caps: &ClientCapabilities) -> bool {
     caps.workspace
         .as_ref()
         .and_then(|workspace| workspace.did_change_watched_files.as_ref())
-        .and_then(|watched| watched.dynamic_registration)
-        .unwrap_or(false)
+        .is_some_and(|watched| watched.dynamic_registration.unwrap_or(false))
 }
 
 /// Glob patterns for every parseable extension, plus the resolver config files.
-pub(crate) fn watched_globs() -> Vec<String> {
-    let mut globs = Vec::new();
-    for lang in meta_ast::LangId::all() {
-        for extension in meta_ast::language::spec_for(lang).extensions {
-            globs.push(format!("**/*.{extension}"));
+pub(crate) fn watched_globs() -> &'static [String] {
+    static GLOBS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    GLOBS.get_or_init(|| {
+        let mut globs = Vec::new();
+        for lang in meta_ast::LangId::all() {
+            for extension in meta_ast::language::spec_for(lang).extensions {
+                globs.push(format!("**/*.{extension}"));
+            }
         }
-    }
-    for name in RESOLVER_CONFIGS {
-        globs.push(format!("**/{name}"));
-    }
-    globs.sort();
-    globs.dedup();
-    globs
+        for name in RESOLVER_CONFIGS {
+            globs.push(format!("**/{name}"));
+        }
+        globs.sort();
+        globs.dedup();
+        globs
+    })
 }
 
 pub(crate) fn is_resolver_config(path: &std::path::Path) -> bool {
@@ -112,9 +113,9 @@ pub(crate) fn register_watched_files(connection: &Connection) -> anyhow::Result<
 
 fn watched_files_registration() -> anyhow::Result<RegistrationParams> {
     let watchers = watched_globs()
-        .into_iter()
+        .iter()
         .map(|glob| FileSystemWatcher {
-            glob_pattern: GlobPattern::String(glob),
+            glob_pattern: GlobPattern::String(glob.clone()),
             kind: None,
         })
         .collect();
@@ -141,18 +142,28 @@ pub(crate) fn root_from_params(params: &lsp_types::InitializeParams) -> anyhow::
             "more than one workspace folder; serving the first"
         );
     }
+    let mut first_error = None;
     for folder in folders {
         let path = DocUri::try_from(&folder.uri)
             .ok()
             .and_then(|uri| uri.to_path());
         match path {
-            Some(path) => return RootDir::try_from(path.as_path()),
+            Some(path) => match RootDir::try_from(path.as_path()) {
+                Ok(root) => return Ok(root),
+                Err(error) => {
+                    tracing::warn!(uri = %folder.uri.as_str(), %error, "workspace folder unusable");
+                    first_error = Some(error);
+                }
+            },
             None => {
                 tracing::warn!(uri = %folder.uri.as_str(), "workspace folder is not a file URI")
             }
         }
     }
-    anyhow::bail!("no workspace folder resolves to a file path")
+    match first_error {
+        Some(error) => Err(error),
+        None => anyhow::bail!("no workspace folder resolves to a file path"),
+    }
 }
 
 #[cfg(test)]

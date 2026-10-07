@@ -47,9 +47,15 @@ impl<'a> QueryCtx<'a> {
         self.snapshot
     }
 
-    /// Extraction for a document URI; the borrow outlives the context borrow.
     pub fn document(&self, uri: &DocUri) -> Option<&'a meta_ast::FileExtraction> {
         self.snapshot.file_by_path(&uri.to_path()?)
+    }
+
+    pub fn cursor(&mut self, uri: &DocUri, pos: Position) -> Option<(PathBuf, usize)> {
+        let path = uri.to_path()?;
+        self.snapshot.file_by_path(&path)?;
+        let byte = self.byte_at(&path, pos)?;
+        Some((path, byte))
     }
 
     pub fn byte_at(&mut self, path: &Path, pos: Position) -> Option<usize> {
@@ -76,8 +82,6 @@ impl<'a> QueryCtx<'a> {
         Some(Location { uri, range })
     }
 
-    /// Declaration range and selection range of one symbol; `selectionRange` names
-    /// the identifier when the engine captured one, else the whole range.
     pub fn symbol_ranges(&mut self, symbol: &meta_ast::Symbol) -> (Range, Range) {
         let path = &symbol.file_path;
         let range = self.range_for(path, &symbol.source_range);
