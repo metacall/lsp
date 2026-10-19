@@ -21,6 +21,30 @@ Polyglot language server for MetaCall workspaces. It gives cross-language naviga
 
 Any LSP client works: Neovim, Helix, Emacs. Point the client at the server binary over stdio. Thin VSCode and Zed clients are planned; no client code ships yet.
 
+## Install
+
+Two ways to get the `meta-call-lsp` binary.
+
+### Prebuilt binary
+
+Download the archive for your platform from the releases page, verify it against the attached `SHA256SUMS`, then install it into `/usr/local/bin` (already on `PATH` for every shell):
+
+```bash
+curl -LO https://github.com/metacall/lsp/releases/download/v0.1.0/meta-call-lsp-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
+tar xzf meta-call-lsp-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
+sudo install -m755 meta-call-lsp-v0.1.0-x86_64-unknown-linux-gnu/meta-call-lsp /usr/local/bin/
+```
+
+### With Cargo
+
+Requires Rust 1.94, pinned in `rust-toolchain.toml`:
+
+```bash
+cargo install --git https://github.com/metacall/lsp --locked
+```
+
+Then verify with `meta-call-lsp --version` and point your client at the binary over stdio.
+
 ## Prebuilt binaries
 
 Every release attaches native binaries for Linux (glibc and musl), macOS (x86_64 and aarch64), and Windows (x86_64 and aarch64):
