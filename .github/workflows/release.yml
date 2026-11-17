@@ -220,9 +220,13 @@ jobs:
               "repository": repo,
               "assets": assets,
           }
-          with open(f"dist/meta-call-lsp-{tag}.json", "w") as handle:
-              json.dump(manifest, handle, indent=2, sort_keys=True)
-              handle.write("\n")
+          # The tagged copy pins a version; the untagged copy lets clients find
+          # the newest release at releases/latest/download/meta-call-lsp.json
+          # without calling the rate-limited GitHub API.
+          for name in (f"meta-call-lsp-{tag}.json", "meta-call-lsp.json"):
+              with open(f"dist/{name}", "w") as handle:
+                  json.dump(manifest, handle, indent=2, sort_keys=True)
+                  handle.write("\n")
           PY
 
       - name: Checksums
