@@ -35,7 +35,7 @@ Every release attaches native binaries for Linux (glibc and musl), macOS (x86_64
 | Windows x86_64 | `meta-call-lsp-<tag>-x86_64-pc-windows-msvc.zip` |
 | Windows aarch64 | `meta-call-lsp-<tag>-aarch64-pc-windows-msvc.zip` |
 
-Each archive contains `meta-call-lsp` (`meta-call-lsp.exe` on Windows), `LICENSE`, and `README.md` under a `meta-call-lsp-<tag>-<target>/` directory. Verify downloads against the attached `SHA256SUMS` and the per-asset `.sha256` files. The `meta-call-lsp-<tag>.json` manifest maps each target to its asset name, URL, and SHA-256 digest for automatic client updates. Releases are not code signed yet; macOS and Windows signing is planned.
+Each archive contains `meta-call-lsp` (`meta-call-lsp.exe` on Windows), `LICENSE`, and `README.md` under a `meta-call-lsp-<tag>-<target>/` directory. Verify downloads against the attached `SHA256SUMS` and the per-asset `.sha256` files. The `meta-call-lsp-<tag>.json` manifest maps each target to its asset name, URL, and SHA-256 digest for automatic client updates. Each release also attaches the same manifest as `meta-call-lsp.json`, so a client can fetch `https://github.com/metacall/lsp/releases/latest/download/meta-call-lsp.json` to find the newest release without the GitHub API. Releases are not code signed yet; macOS and Windows signing is planned.
 
 Run `meta-call-lsp --version` after extraction, then point the client at the binary over stdio. The server accepts `--stdio` for clients that pass it.
 
