@@ -19,7 +19,9 @@ Polyglot language server for MetaCall workspaces. It gives cross-language naviga
 
 ## Clients
 
-Any LSP client works: Neovim, Helix, Emacs. Point the client at the server binary over stdio. Thin VSCode and Zed clients are planned; no client code ships yet.
+Point an LSP client such as Neovim, Helix, or Emacs at the server binary over stdio. Thin VSCode and Zed clients are planned; no client code ships yet.
+
+The client must support pull diagnostics (`textDocument/diagnostic`, LSP 3.17). The server is pull only: it rejects `initialize` from a client that does not advertise the capability, so an older client fails at startup instead of running without diagnostics.
 
 ## Prebuilt binaries
 
